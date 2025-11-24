@@ -1,0 +1,71 @@
+/* src/app/globals.css */
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; color: #111; }
+
+.wrap { display: grid; grid-template-columns: 360px 1fr; height: 100vh; }
+
+.panel { padding: 16px; overflow: auto; border-right: 1px solid #eee; }
+.panel h1 { font-size: 20px; margin: 0 0 8px; }
+.hint { margin: 0 0 12px; color: #555; line-height: 1.4; }
+
+label { display: block; font-size: 13px; margin: 10px 0 6px; color: #333; }
+input { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #d0d0d0; font-size: 14px; }
+
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+.row { display: flex; gap: 8px; align-items: center; }
+.muted { color: #888; font-size: 12px; }
+
+/* Primärer Button + Spinner */
+.primary {
+  width: 100%;
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: #1363ff;
+  color: #fff;
+  border: none;
+  font-weight: 600;
+  font-size: 15px;
+  cursor: pointer;
+  transition: background .15s ease, opacity .15s ease;
+}
+.primary:hover { background: #0f54d6; }
+.primary:disabled { opacity: .65; cursor: default; }
+.primary.loading { position: relative; }
+.primary.loading::after {
+  content: "";
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid rgba(255,255,255,.65);
+  border-top-color: transparent;
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: translateY(-50%) rotate(360deg); } }
+
+.legend { font-size: 12px; color: #555; margin: 8px 0 0; }
+.dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: -1px; margin-right: 6px; }
+.dot.blue { background: #1363ff; }
+.dot.gray { background: #666; }
+
+.error { margin-top: 10px; color: #b00020; background: #fde8ea; border: 1px solid #f7c6cb; padding: 8px 10px; border-radius: 8px; }
+
+.directions { margin-top: 14px; background: #fafafa; border: 1px solid #eee; border-radius: 10px; padding: 10px; }
+.directions .head { display: flex; align-items: center; gap: 8px; }
+.directions .head .spacer { flex: 1; }
+.directions .head button { padding: 6px 10px; border-radius: 8px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
+.directions .meta { color: #333; margin: 8px 0 6px; }
+.directions ol { margin: 0; padding-left: 20px; line-height: 1.5; max-height: 260px; overflow: auto; }
+
+.map { height: 100%; width: 100%; position: relative; }
+
+.pin {
+  width: 16px; height: 16px; border-radius: 50%;
+  border: 2px solid #fff; box-shadow: 0 0 0 2px rgba(0,0,0,.25);
+}

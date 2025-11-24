@@ -1,0 +1,6 @@
+src/app/page.tsx:4:import maplibregl, { Map, MapMouseEvent } from "maplibre-gl";
+src/app/page.tsx:5:import "maplibre-gl/dist/maplibre-gl.css";
+src/app/page.tsx:336:    const map = new maplibregl.Map({
+src/app/page.tsx:424:    (map.getSource("route-active") as maplibregl.GeoJSONSource).setData({
+src/app/page.tsx:428:    (map.getSource("route-alts") as maplibregl.GeoJSONSource).setData({
+src/app/page.tsx:442:    (map.getSource("points") as maplibregl.GeoJSONSource).setData({
