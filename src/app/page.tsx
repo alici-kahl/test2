@@ -535,6 +535,58 @@ export default function Page() {
     const popup = new maplibregl.Popup({ closeButton: true, closeOnClick: true });
     const openRoadworkPopup = (f: maplibregl.MapboxGeoJSONFeature) => {
       const p = f.properties || {};
+
+      const fmtNum = (v: any, unit: string) => {
+        if (v === null || v === undefined || v === "") return "unbekannt";
+        const n =
+          typeof v === "number"
+            ? v
+            : typeof v === "string"
+            ? Number(v.replace(",", "."))
+            : NaN;
+      return Number.isFinite(n) ? `${n} ${unit}` : "unbekannt";
+    };
+
+    const fmtBool = (v: any) =>
+      v === true ? "JA" : v === false ? "NEIN" : "unbekannt";
+
+    const html = `
+      <div style="min-width:260px; max-width:360px">
+        <div style="font-weight:600; margin-bottom:6px">
+          ${p.title ?? "Baustelle"}
+        </div>
+
+        <div style="font-size:12px; color:#444; line-height:1.4">
+          <div><b>ID:</b> ${p.external_id ?? "-"}</div>
+          <div><b>Gültig:</b> ${p.valid_from ?? "-"} – ${p.valid_to ?? "-"}</div>
+          <div><b>Fenster:</b> ${p.start_time ?? "-"}–${p.end_time ?? "-"} (Tage: ${(p.days || []).join?.(",") ?? "-"})</div>
+          <div><b>Länge:</b> ${typeof p.length_m === "number" ? (p.length_m / 1000).toFixed(2) + " km" : "-"}</div>
+          <div><b>Quelle:</b> ${p.external_id ? "Autobahn.de" : (p.source ?? "–")}</div>
+
+          <hr style="border:none;border-top:1px solid #eee;margin:8px 0" />
+
+          <div style="font-weight:600; margin-bottom:4px">Limits</div>
+          <div><b>Max. Breite:</b> ${fmtNum(p.max_width_m, "m")}</div>
+          <div><b>Max. Höhe:</b> ${fmtNum(p.max_height_m, "m")}</div>
+          <div><b>Max. Gewicht:</b> ${fmtNum(p.max_weight_t, "t")}</div>
+          <div><b>Max. Achslast:</b> ${fmtNum(p.max_axle_t ?? p.max_axleload_t, "t")}</div>
+          <div><b>Hard-Block:</b> ${fmtBool(p._hard_block)}</div>
+        </div>
+      </div>
+    `;
+
+    const g: any = f.geometry;
+    let center: [number, number] | undefined;
+
+    if (g?.type === "Point") center = g.coordinates;
+    if (!center && g?.type === "LineString" && Array.isArray(g.coordinates)) {
+      center = g.coordinates[Math.floor(g.coordinates.length / 2)];
+    }
+
+    if (center) popup.setLngLat(center).setHTML(html).addTo(map);
+  };
+
+      const p = f.properties || {};
       const html = `
         <div style="min-width:220px">
           <div style="font-weight:600; margin-bottom:4px">${p.title ?? "Baustelle"}</div>
