@@ -612,9 +612,9 @@ export default function Page() {
             <hr style="border:none;border-top:1px solid #eee;margin:8px 0" />
 
             <div style="font-weight:600; margin-bottom:4px">Limits</div>
-            <div><b>Max. Breite:</b> ${fmtNum(p.max_width_m, "m", 2)}</div>
-            <div><b>Max. Höhe:</b> ${fmtNum(p.max_height_m, "m", 2)}</div>
-            <div><b>Max. Gewicht:</b> ${fmtNum(p.max_weight_t, "t", 1)}</div>
+            <div><b>Max. Breite:</b> ${fmtNum(p.max_width_m ?? p.max_width, "m", 2)}</div>
+            <div><b>Max. Höhe:</b> ${fmtNum(p.max_height_m ?? p.max_height, "m", 2)}</div>
+            <div><b>Max. Gewicht:</b> ${fmtNum(p.max_weight_t ?? p.max_weight, "t", 1)}</div>
             <div><b>Max. Achslast:</b> ${fmtNum(p.max_axle_t ?? p.max_axleload_t, "t", 1)}</div>
             <div><b>Hard-Block:</b> ${fmtBool(p._hard_block)}</div>
           </div>
