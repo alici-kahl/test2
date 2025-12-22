@@ -633,10 +633,12 @@ export default function Page() {
     };
 
     map.on("click", "roadworks-line", (e) => {
+      console.log("CLICK roadworks-line", e);
       const f = e.features?.[0];
       if (f) openRoadworkPopup(f);
     });
     map.on("click", "roadworks-icon", (e) => {
+      console.log("CLICK roadworks-icon", e);
       const f = e.features?.[0];
       if (f) openRoadworkPopup(f);
     });
