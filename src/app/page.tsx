@@ -55,11 +55,24 @@ function haversine(lat1: number, lon1: number, lat2: number, lon2: number) {
 function formatSuggestion(row: any): string | null {
   const a = row?.address || {};
   const road =
-    a.road || a.pedestrian || a.footway || a.path || a.cycleway || a.residential || a.neighbourhood;
+    a.road ||
+    a.pedestrian ||
+    a.footway ||
+    a.path ||
+    a.cycleway ||
+    a.residential ||
+    a.neighbourhood;
   const housenr = a.house_number || "";
   const postcode = a.postcode || "";
   const city =
-    a.city || a.town || a.village || a.municipality || a.suburb || a.hamlet || a.county || "";
+    a.city ||
+    a.town ||
+    a.village ||
+    a.municipality ||
+    a.suburb ||
+    a.hamlet ||
+    a.county ||
+    "";
   if (!road && !postcode && !city) return null;
   const streetPart = [road, housenr].filter(Boolean).join(" ").trim();
   const placePart = [postcode, city].filter(Boolean).join(", ").trim();
@@ -145,26 +158,40 @@ function AutocompleteInput(props: {
         if (reqIdRef.current !== myReqId) return;
 
         let list: Suggestion[] = Array.isArray(j)
-          ? j
+          ? (j
               .map((row: any) => {
                 const label = formatSuggestion(row);
                 if (!label) return null;
-                return { label, coord: [Number(row.lon), Number(row.lat)] as Coords, raw: row };
+                return {
+                  label,
+                  coord: [Number(row.lon), Number(row.lat)] as Coords,
+                  raw: row,
+                };
               })
-              .filter(Boolean) as Suggestion[]
+              .filter(Boolean) as Suggestion[])
           : [];
 
         const ctr = info.center;
         const b = info.bounds;
         const inBox = (s: Suggestion) =>
-          b ? s.coord[0] >= b.left && s.coord[0] <= b.right && s.coord[1] >= b.bottom && s.coord[1] <= b.top : false;
+          b
+            ? s.coord[0] >= b.left &&
+              s.coord[0] <= b.right &&
+              s.coord[1] >= b.bottom &&
+              s.coord[1] <= b.top
+            : false;
 
         list = list
           .map((s) => {
-            const dist = ctr ? haversine(ctr.lat, ctr.lon, s.coord[1], s.coord[0]) : Number.POSITIVE_INFINITY;
+            const dist = ctr
+              ? haversine(ctr.lat, ctr.lon, s.coord[1], s.coord[0])
+              : Number.POSITIVE_INFINITY;
             const rank = typeof s.raw?.place_rank === "number" ? s.raw.place_rank : 0;
             const imp = typeof s.raw?.importance === "number" ? s.raw.importance : 0;
-            return { s, key: [inBox(s) ? 0 : 1, Math.round(dist), -rank, -imp, s.label.toLowerCase()] };
+            return {
+              s,
+              key: [inBox(s) ? 0 : 1, Math.round(dist), -rank, -imp, s.label.toLowerCase()],
+            };
           })
           .sort((a: any, b2: any) => {
             for (let i = 0; i < a.key.length; i++) {
@@ -242,7 +269,8 @@ function AutocompleteInput(props: {
             marginTop: 4,
             maxHeight: 280,
             overflow: "auto",
-            boxShadow: "0 8px 16px rgba(15,23,42,.08), 0 1px 2px rgba(15,23,42,.08)",
+            boxShadow:
+              "0 8px 16px rgba(15,23,42,.08), 0 1px 2px rgba(15,23,42,.08)",
           }}
         >
           {loading && <div style={{ padding: 10, fontSize: 13, color: "#666" }}>Suche…</div>}
@@ -289,11 +317,19 @@ export default function Page() {
   const [usePlanner, setUsePlanner] = useState(true);
 
   // >>> Planner-Presets (starten mit DEFAULT_PLAN_PRESET)
-  const [corridorWidth, setCorridorWidth] = useState<number>(DEFAULT_PLAN_PRESET.corridor.width_m);
-  const [respectDir, setRespectDir] = useState<boolean>(DEFAULT_PLAN_PRESET.respect_direction);
+  const [corridorWidth, setCorridorWidth] = useState<number>(
+    DEFAULT_PLAN_PRESET.corridor.width_m
+  );
+  const [respectDir, setRespectDir] = useState<boolean>(
+    DEFAULT_PLAN_PRESET.respect_direction
+  );
   const [rwBuffer, setRwBuffer] = useState<number>(DEFAULT_PLAN_PRESET.roadworks.buffer_m);
-  const [avoidTargetMax, setAvoidTargetMax] = useState<number>(DEFAULT_PLAN_PRESET.avoid_target_max);
-  const [valhallaSoftMax, setValhallaSoftMax] = useState<number>(DEFAULT_PLAN_PRESET.valhalla_soft_max);
+  const [avoidTargetMax, setAvoidTargetMax] = useState<number>(
+    DEFAULT_PLAN_PRESET.avoid_target_max
+  );
+  const [valhallaSoftMax, setValhallaSoftMax] = useState<number>(
+    DEFAULT_PLAN_PRESET.valhalla_soft_max
+  );
   const [alternates, setAlternates] = useState<number>(DEFAULT_PLAN_PRESET.alternates);
 
   // Telemetrie vom Planer
@@ -355,10 +391,16 @@ export default function Page() {
           points: { type: "geojson", data: { type: "FeatureCollection", features: [] } },
 
           // Linien-Quelle
-          "roadworks-lines": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
+          "roadworks-lines": {
+            type: "geojson",
+            data: { type: "FeatureCollection", features: [] },
+          },
 
           // Ungeclusterte Icon-Quelle (für Sicht ab Zoom >= 11)
-          "roadworks-icons": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
+          "roadworks-icons": {
+            type: "geojson",
+            data: { type: "FeatureCollection", features: [] },
+          },
 
           // Geclusterte Spiegelquelle derselben Punkte (für Zoom <= 10)
           "roadworks-icons-cluster": {
@@ -366,7 +408,7 @@ export default function Page() {
             data: { type: "FeatureCollection", features: [] },
             cluster: true,
             clusterMaxZoom: 10,
-            clusterRadius: 50
+            clusterRadius: 50,
           },
         },
         layers: [
@@ -391,7 +433,12 @@ export default function Page() {
             id: "route-alts-line",
             type: "line",
             source: "route-alts",
-            paint: { "line-color": "#666", "line-width": 5, "line-opacity": 0.9, "line-dasharray": [2, 2] },
+            paint: {
+              "line-color": "#666",
+              "line-width": 5,
+              "line-opacity": 0.9,
+              "line-dasharray": [2, 2],
+            },
             layout: { "line-join": "round", "line-cap": "round" },
           },
           {
@@ -436,10 +483,15 @@ export default function Page() {
               "circle-stroke-color": "#7a4a15",
               "circle-stroke-width": 1.2,
               "circle-radius": [
-                "interpolate", ["linear"], ["zoom"],
-                3, 10,
-                6, 14,
-                9, ["+", 10, ["*", 2, ["ln", ["+", 2, ["get", "point_count"]]]]]
+                "interpolate",
+                ["linear"],
+                ["zoom"],
+                3,
+                10,
+                6,
+                14,
+                9,
+                ["+", 10, ["*", 2, ["ln", ["+", 2, ["get", "point_count"]]]]],
               ],
             },
           },
@@ -454,7 +506,7 @@ export default function Page() {
               "text-field": ["get", "point_count_abbreviated"],
               "text-font": ["Open Sans Bold", "Arial Unicode MS Bold"],
               "text-size": ["interpolate", ["linear"], ["zoom"], 3, 10, 9, 12],
-              "text-allow-overlap": true
+              "text-allow-overlap": true,
             },
             paint: { "text-color": "#ffffff" },
           },
@@ -472,13 +524,7 @@ export default function Page() {
               "icon-anchor": "center",
               "icon-pitch-alignment": "viewport",
               "icon-rotation-alignment": "viewport",
-              "icon-size": [
-                "interpolate", ["linear"], ["zoom"],
-                11, 0.16,
-                13, 0.20,
-                15, 0.26,
-                17, 0.32
-              ]
+              "icon-size": ["interpolate", ["linear"], ["zoom"], 11, 0.16, 13, 0.2, 15, 0.26, 17, 0.32],
             },
           },
 
@@ -493,9 +539,9 @@ export default function Page() {
               "circle-radius": ["interpolate", ["linear"], ["zoom"], 11, 2.0, 17, 4.0],
               "circle-color": "#E67E22",
               "circle-stroke-width": 1.5,
-              "circle-stroke-color": "#ffffff"
-            }
-          }
+              "circle-stroke-color": "#ffffff",
+            },
+          },
         ],
       },
       center: [7.1, 51.1],
@@ -531,80 +577,58 @@ export default function Page() {
       if (typeof idx === "number") setActiveIdx(idx);
     });
 
-    // Popups für Straßenarbeiten
+    // Popups für Straßenarbeiten (FIXED: nur eine Popup-Version, keine Duplikate)
     const popup = new maplibregl.Popup({ closeButton: true, closeOnClick: true });
-    const openRoadworkPopup = (f: maplibregl.MapboxGeoJSONFeature) => {
-      const p = f.properties || {};
 
-      const fmtNum = (v: any, unit: string) => {
+    const openRoadworkPopup = (f: maplibregl.MapboxGeoJSONFeature) => {
+      const p: any = f.properties || {};
+
+      const fmtNum = (v: any, unit: string, digits = 2) => {
         if (v === null || v === undefined || v === "") return "unbekannt";
         const n =
           typeof v === "number"
             ? v
             : typeof v === "string"
-            ? Number(v.replace(",", "."))
-            : NaN;
-      return Number.isFinite(n) ? `${n} ${unit}` : "unbekannt";
-    };
+              ? Number(v.replace(",", "."))
+              : NaN;
+        return Number.isFinite(n) ? `${n.toFixed(digits)} ${unit}` : "unbekannt";
+      };
 
-    const fmtBool = (v: any) =>
-      v === true ? "JA" : v === false ? "NEIN" : "unbekannt";
+      const fmtBool = (v: any) => (v === true ? "JA" : v === false ? "NEIN" : "unbekannt");
+      const fmtDays = (v: any) => (Array.isArray(v) ? v.join(",") : "-");
 
-    const html = `
-      <div style="min-width:260px; max-width:360px">
-        <div style="font-weight:600; margin-bottom:6px">
-          ${p.title ?? "Baustelle"}
-        </div>
-
-        <div style="font-size:12px; color:#444; line-height:1.4">
-          <div><b>ID:</b> ${p.external_id ?? "-"}</div>
-          <div><b>Gültig:</b> ${p.valid_from ?? "-"} – ${p.valid_to ?? "-"}</div>
-          <div><b>Fenster:</b> ${p.start_time ?? "-"}–${p.end_time ?? "-"} (Tage: ${(p.days || []).join?.(",") ?? "-"})</div>
-          <div><b>Länge:</b> ${typeof p.length_m === "number" ? (p.length_m / 1000).toFixed(2) + " km" : "-"}</div>
-          <div><b>Quelle:</b> ${p.external_id ? "Autobahn.de" : (p.source ?? "–")}</div>
-
-          <hr style="border:none;border-top:1px solid #eee;margin:8px 0" />
-
-          <div style="font-weight:600; margin-bottom:4px">Limits</div>
-          <div><b>Max. Breite:</b> ${fmtNum(p.max_width_m, "m")}</div>
-          <div><b>Max. Höhe:</b> ${fmtNum(p.max_height_m, "m")}</div>
-          <div><b>Max. Gewicht:</b> ${fmtNum(p.max_weight_t, "t")}</div>
-          <div><b>Max. Achslast:</b> ${fmtNum(p.max_axle_t ?? p.max_axleload_t, "t")}</div>
-          <div><b>Hard-Block:</b> ${fmtBool(p._hard_block)}</div>
-        </div>
-      </div>
-    `;
-
-    const g: any = f.geometry;
-    let center: [number, number] | undefined;
-
-    if (g?.type === "Point") center = g.coordinates;
-    if (!center && g?.type === "LineString" && Array.isArray(g.coordinates)) {
-      center = g.coordinates[Math.floor(g.coordinates.length / 2)];
-    }
-
-    if (center) popup.setLngLat(center).setHTML(html).addTo(map);
-  };
-
-      const p = f.properties || {};
       const html = `
-        <div style="min-width:220px">
-          <div style="font-weight:600; margin-bottom:4px">${p.title ?? "Baustelle"}</div>
-          <div style="font-size:12px; color:#444">
+        <div style="min-width:260px; max-width:360px">
+          <div style="font-weight:600; margin-bottom:6px">${p.title ?? "Baustelle"}</div>
+          <div style="font-size:12px; color:#444; line-height:1.4">
             <div><b>ID:</b> ${p.external_id ?? "-"}</div>
             <div><b>Gültig:</b> ${p.valid_from ?? "-"} – ${p.valid_to ?? "-"}</div>
-            <div><b>Fenster:</b> ${p.start_time ?? "-"}–${p.end_time ?? "-"} (Tage: ${(p.days||[]).join?.(",") ?? "-"})</div>
-            <div><b>Länge:</b> ${typeof p.length_m === "number" ? (p.length_m/1000).toFixed(2)+" km" : "-"}</div>
-            <div><b>Quelle:</b> ${p.external_id ? "Autobahn.de" : (p.source ?? "–")}</div>
+            <div><b>Fenster:</b> ${p.start_time ?? "-"}–${p.end_time ?? "-"} (Tage: ${fmtDays(p.days)})</div>
+            <div><b>Länge:</b> ${
+              typeof p.length_m === "number" ? (p.length_m / 1000).toFixed(2) + " km" : "-"
+            }</div>
+            <div><b>Quelle:</b> ${p.source ?? "–"}</div>
+
+            <hr style="border:none;border-top:1px solid #eee;margin:8px 0" />
+
+            <div style="font-weight:600; margin-bottom:4px">Limits</div>
+            <div><b>Max. Breite:</b> ${fmtNum(p.max_width_m, "m", 2)}</div>
+            <div><b>Max. Höhe:</b> ${fmtNum(p.max_height_m, "m", 2)}</div>
+            <div><b>Max. Gewicht:</b> ${fmtNum(p.max_weight_t, "t", 1)}</div>
+            <div><b>Max. Achslast:</b> ${fmtNum(p.max_axle_t ?? p.max_axleload_t, "t", 1)}</div>
+            <div><b>Hard-Block:</b> ${fmtBool(p._hard_block)}</div>
           </div>
         </div>
       `;
+
       const g: any = f.geometry;
       let center: [number, number] | undefined;
-      if (g?.type === "Point") center = g.coordinates;
+
+      if (g?.type === "Point") center = g.coordinates as [number, number];
       if (!center && g?.type === "LineString" && Array.isArray(g.coordinates) && g.coordinates.length) {
-        center = g.coordinates[Math.floor(g.coordinates.length / 2)];
+        center = g.coordinates[Math.floor(g.coordinates.length / 2)] as [number, number];
       }
+
       if (center) popup.setLngLat(center).setHTML(html).addTo(map);
     };
 
@@ -673,9 +697,17 @@ export default function Page() {
 
       const pts: any[] = [];
       if (startCoord)
-        pts.push({ type: "Feature", geometry: { type: "Point", coordinates: startCoord }, properties: { role: "start" } });
+        pts.push({
+          type: "Feature",
+          geometry: { type: "Point", coordinates: startCoord },
+          properties: { role: "start" },
+        });
       if (endCoord)
-        pts.push({ type: "Feature", geometry: { type: "Point", coordinates: endCoord }, properties: { role: "end" } });
+        pts.push({
+          type: "Feature",
+          geometry: { type: "Point", coordinates: endCoord },
+          properties: { role: "end" },
+        });
       (map.getSource("points") as maplibregl.GeoJSONSource).setData({
         type: "FeatureCollection",
         features: pts,
@@ -701,7 +733,12 @@ export default function Page() {
     if (!map || !mapLoadedRef.current) return;
 
     const b = map.getBounds();
-    const bbox: [number, number, number, number] = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
+    const bbox: [number, number, number, number] = [
+      b.getWest(),
+      b.getSouth(),
+      b.getEast(),
+      b.getNorth(),
+    ];
 
     // lokale Zeit -> ISO UTC
     const local = new Date(whenIsoLocal);
@@ -727,7 +764,11 @@ export default function Page() {
         .map((f: any) => {
           const p = f.properties || {};
           if (typeof p._icon_lon === "number" && typeof p._icon_lat === "number") {
-            return { type: "Feature", geometry: { type: "Point", coordinates: [p._icon_lon, p._icon_lat] }, properties: p };
+            return {
+              type: "Feature",
+              geometry: { type: "Point", coordinates: [p._icon_lon, p._icon_lat] },
+              properties: p,
+            };
           }
           const g = f.geometry;
           if (g?.type === "LineString" && Array.isArray(g.coordinates) && g.coordinates.length) {
@@ -890,11 +931,15 @@ export default function Page() {
     lines.push("");
     lines.push("Anweisungen:");
     (f.properties?.maneuvers ?? []).forEach((s: any, i: number) =>
-      lines.push(`${i + 1}. ${s.instruction}  (${s.distance_km.toFixed(1)} km, ${sToMin(s.duration_s)} min)`)
+      lines.push(
+        `${i + 1}. ${s.instruction}  (${s.distance_km.toFixed(1)} km, ${sToMin(s.duration_s)} min)`
+      )
     );
     lines.push("");
     lines.push("Befahrene Straßen (chronologisch, nicht dedupliziert):");
-    (f.properties?.streets_sequence ?? []).forEach((name: string, i: number) => lines.push(`${i + 1}. ${name}`));
+    (f.properties?.streets_sequence ?? []).forEach((name: string, i: number) =>
+      lines.push(`${i + 1}. ${name}`)
+    );
     const blob = new Blob([lines.join("\n")], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
