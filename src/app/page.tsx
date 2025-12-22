@@ -578,7 +578,7 @@ export default function Page() {
     });
 
     // Popups für Straßenarbeiten (FIXED: nur eine Popup-Version, keine Duplikate)
-    const popup = new maplibregl.Popup({ closeButton: true, closeOnClick: true });
+    const popup = new maplibregl.Popup({ closeButton: true, closeOnClick: false });
 
     const openRoadworkPopup = (f: maplibregl.MapboxGeoJSONFeature) => {
       const p: any = f.properties || {};
