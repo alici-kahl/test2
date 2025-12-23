@@ -68,7 +68,13 @@ function getLimits(p: any): Limits {
   let weight =
     p.max_weight_t ?? p.max_weight ?? p.weight ?? p.weight_limit ?? p.gewicht ?? null;
   let axle =
-    p.max_axleload_t ?? p.max_axle_t ?? p.axleload_t ?? p.axle_load_t ?? p.axleload ?? p.achslast ?? null;
+    p.max_axleload_t ??
+    p.max_axle_t ??
+    p.axleload_t ??
+    p.axle_load_t ??
+    p.axleload ??
+    p.achslast ??
+    null;
 
   const hard =
     toBool(p.hard_block) ||
@@ -104,10 +110,9 @@ function getLimits(p: any): Limits {
     if (wtMatch) weight = wtMatch[1];
   }
 
-  // try to extract axle load from text if missing (rare, but safe)
+  // try to extract axle load from text if missing
   if (toNumOrNull(axle) === null) {
-    const aMatch =
-      text.match(/(?:Achslast|axle)[^0-9]*([0-9]+(?:[.,][0-9]+)?)\s*t/i);
+    const aMatch = text.match(/(?:Achslast|axle)[^0-9]*([0-9]+(?:[.,][0-9]+)?)\s*t/i);
     if (aMatch) axle = aMatch[1];
   }
 
@@ -155,19 +160,16 @@ function isHardBlockedOrConflicting(
   return { conflict: reasons.length > 0, reasons };
 }
 
-// --- FINALER FIX: NUR NOCH RECHTECKE ---
-// Robust: immer ein Avoid-Rechteck erzeugen (Fallback über bbox + padding),
-// damit "stuck" nicht entsteht, nur weil buffer() eine Geometrie nicht puffern kann.
-function createAvoidPolygon(f: Feature<any>): Feature<Polygon> | null {
+// Avoid-Polygon: immer Rechteck (BBox) – aber skalierbar (kmPad)
+function createAvoidPolygonScaled(f: Feature<any>, kmPad: number): Feature<Polygon> | null {
   try {
     if (!f || !f.geometry) return null;
 
-    const km = 0.02; // ~20m
-    const degPad = km / 111; // grobe Umrechnung km -> Grad (reicht für kleines Padding)
+    const degPad = kmPad / 111;
 
-    // 1) Primär: bbox vom gepufferten Feature (funktioniert bei vielen Geometrien gut)
+    // 1) Primär: bbox vom gepufferten Feature
     try {
-      const bf = buffer(f as any, km, { units: "kilometers" }) as any;
+      const bf = buffer(f as any, kmPad, { units: "kilometers" }) as any;
       if (bf) {
         const b = bboxFn(bf) as [number, number, number, number];
         return polygon([
@@ -184,7 +186,7 @@ function createAvoidPolygon(f: Feature<any>): Feature<Polygon> | null {
       // ignore -> fallback
     }
 
-    // 2) Fallback: bbox direkt auf der Original-Geometrie + kleiner Padding
+    // 2) Fallback: bbox der Originalgeometrie + padding
     try {
       const b0 = bboxFn(f as any) as [number, number, number, number];
       const b: [number, number, number, number] = [
@@ -209,7 +211,7 @@ function createAvoidPolygon(f: Feature<any>): Feature<Polygon> | null {
     // 3) Letzter Fallback: centroid puffern
     try {
       const c = centroid(f as any);
-      const bf = buffer(c as any, km, { units: "kilometers" }) as any;
+      const bf = buffer(c as any, kmPad, { units: "kilometers" }) as any;
       if (!bf) return null;
       const b = bboxFn(bf) as [number, number, number, number];
       return polygon([
@@ -235,6 +237,7 @@ async function callValhalla(
 ): Promise<{ geojson: FeatureCollection; error?: string }> {
   const payload = {
     ...reqBody,
+    // Plan->Valhalla Endpoint normalisiert das auf exclude_polygons
     avoid_polygons: avoidPolys.length > 0 ? avoidPolys.map((p) => p.geometry) : undefined,
   };
 
@@ -258,7 +261,7 @@ async function callValhalla(
       const txt = await res.text();
       return {
         geojson: { type: "FeatureCollection", features: [] },
-        error: `Status ${res.status}: ${txt.slice(0, 100)}`,
+        error: `Status ${res.status}: ${txt.slice(0, 200)}`,
       };
     }
     const data = await res.json();
@@ -291,52 +294,70 @@ export async function POST(req: NextRequest) {
 
   console.log(`[PLAN START] Veh: ${vWidth}m / ${vWeight}t`);
 
-  const queryBBox = makeSafeBBox(start, end, 50);
+  // Wichtig: wenn wir „Korridor verlassen“ wollen, muss der Daten-BBox großzügig sein.
+  // (Das beschränkt NICHT Valhalla, sondern nur, welche Hindernisse wir laden.)
+  const queryBBox = makeSafeBBox(start, end, 150);
+
   let allObstacles: Feature<any>[] = [];
 
   /* 1. Lade Daten */
   try {
-    const rRes = await fetchWithTimeout(new URL("/api/restrictions", req.nextUrl.origin), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        ts,
-        tz,
-        bbox: queryBBox,
-        buffer_m: 10,
-        vehicle: body.vehicle,
-        max_polygons: 1000,
-      }),
-    }, 5000);
+    const rRes = await fetchWithTimeout(
+      new URL("/api/restrictions", req.nextUrl.origin),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ts,
+          tz,
+          bbox: queryBBox,
+          buffer_m: 10,
+          vehicle: body.vehicle,
+          max_polygons: 1000,
+        }),
+      },
+      5000,
+    );
     if (rRes.ok) {
       const j = await rRes.json();
       allObstacles.push(...(j.geojson?.features || []));
     }
-  } catch (e) {}
+  } catch {}
 
   try {
-    const rwRes = await fetchWithTimeout(new URL("/api/roadworks", req.nextUrl.origin), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ts, tz, bbox: queryBBox, only_motorways: false }),
-    }, 5000);
+    const rwRes = await fetchWithTimeout(
+      new URL("/api/roadworks", req.nextUrl.origin),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ts,
+          tz,
+          bbox: queryBBox,
+          // Autobahn-fokussiert laden
+          only_motorways: true,
+        }),
+      },
+      5000,
+    );
     if (rwRes.ok) {
       const j = await rwRes.json();
       allObstacles.push(...(j.features || []));
     }
-  } catch (e) {}
+  } catch {}
 
   /* 2. Iteration Loop */
   let currentRouteGeoJSON: FeatureCollection = { type: "FeatureCollection", features: [] };
   const activeAvoids: Feature<Polygon>[] = [];
-  const avoidIds = new Set<string>();
+
+  // IDs + Versuchszähler pro Hindernis (entscheidend gegen "stuck")
+  const avoidAttempts = new Map<string, number>();
 
   let iterations = 0;
-  const MAX_ITERATIONS = 6;
+  const MAX_ITERATIONS = 8;
   let routeIsClean = false;
   let finalError: string | null = null;
 
-  // NEW: für Response/Debug
   let lastHardCollisions = 0;
   let lastAddedAvoids = 0;
 
@@ -378,6 +399,7 @@ export async function POST(req: NextRequest) {
       break;
     }
 
+    // Route-„Hitbox“ (15m)
     // @ts-ignore
     const routeBuffer = buffer(routeLine, 0.015, { units: "kilometers" });
 
@@ -387,12 +409,16 @@ export async function POST(req: NextRequest) {
     for (const obs of allObstacles) {
       if (!obs || !obs.geometry) continue;
 
-      const obsId =
-        JSON.stringify((obs as any).geometry?.coordinates ?? "").slice(0, 50) + (obs.properties?.id || "");
+      const p = obs.properties || {};
 
+      // STABILER obsKey: zuerst echte ID, sonst fallback auf Geometrie-Ausschnitt
+      const obsKey =
+        String(p.id ?? p.source_id ?? p.object_id ?? p.uid ?? "") ||
+        JSON.stringify((obs as any).geometry?.coordinates ?? "").slice(0, 120);
+
+      // keine Kollision -> skip
       if (!booleanIntersects(routeBuffer as any, obs as any)) continue;
 
-      const p = obs.properties || {};
       const limits = getLimits(p);
       const title = p.title || p.description || "unknown";
 
@@ -401,24 +427,31 @@ export async function POST(req: NextRequest) {
 
       hardCollisions++;
 
-      if (avoidIds.has(obsId)) {
-        console.warn(
-          `[STILL COLLIDING AFTER AVOID] "${title.slice(0, 30)}..." -> ${reasons.join(", ")}`,
-        );
+      // Wenn wir dieses Hindernis schon avoided haben, aber es kollidiert weiterhin,
+      // erzeugen wir einen GRÖSSEREN Avoid (statt "stuck").
+      const attempt = (avoidAttempts.get(obsKey) ?? 0) + 1;
+      avoidAttempts.set(obsKey, attempt);
+
+      // Skalierung (km): 20m, 60m, 150m, 300m …
+      const kmPad = attempt === 1 ? 0.02 : attempt === 2 ? 0.06 : attempt === 3 ? 0.15 : 0.3;
+
+      // Sicherheitslimit: nach 4 Versuchen geben wir pro Objekt auf (sonst explodiert Avoid-Menge)
+      if (attempt > 4) {
+        console.warn(`[GIVE UP] "${title.slice(0, 30)}..." still colliding after ${attempt - 1} avoid expansions`);
         continue;
       }
 
-      console.log(`[CONFLICT] "${title.slice(0, 30)}..." -> Reason: ${reasons.join(", ")}`);
+      console.log(
+        `[CONFLICT] "${title.slice(0, 30)}..." -> ${reasons.join(", ")} | avoid_expand_attempt=${attempt} pad=${kmPad}km`,
+      );
 
-      const poly = createAvoidPolygon(obs);
+      const poly = createAvoidPolygonScaled(obs, kmPad);
       if (poly) {
         activeAvoids.push(poly);
-        avoidIds.add(obsId);
         addedAvoids++;
       }
     }
 
-    // NEW: speichern für Response/Debug
     lastHardCollisions = hardCollisions;
     lastAddedAvoids = addedAvoids;
 
@@ -449,11 +482,12 @@ export async function POST(req: NextRequest) {
       for (const obs of allObstacles) {
         if (!obs || !obs.geometry) continue;
 
+        const p = obs.properties || {};
         const obsId =
-          JSON.stringify((obs as any).geometry?.coordinates ?? "").slice(0, 50) + (obs.properties?.id || "");
+          String(p.id ?? p.source_id ?? p.object_id ?? p.uid ?? "") ||
+          JSON.stringify((obs as any).geometry?.coordinates ?? "").slice(0, 120);
 
         if (booleanIntersects(routeBuffer as any, obs as any)) {
-          const p = obs.properties || {};
           const limits = getLimits(p);
           warnings.push({
             id: p.id ?? obsId,
@@ -466,9 +500,8 @@ export async function POST(req: NextRequest) {
         }
       }
     }
-  } catch (e) {}
+  } catch {}
 
-  // NEW: wenn nicht clean -> HTTP Fehlerstatus, damit Frontend es NICHT als "OK" behandelt
   const statusCode = routeIsClean ? 200 : 409;
 
   return NextResponse.json(
