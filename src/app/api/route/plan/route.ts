@@ -156,23 +156,74 @@ function isHardBlockedOrConflicting(
 }
 
 // --- FINALER FIX: NUR NOCH RECHTECKE ---
+// Robust: immer ein Avoid-Rechteck erzeugen (Fallback über bbox + padding),
+// damit "stuck" nicht entsteht, nur weil buffer() eine Geometrie nicht puffern kann.
 function createAvoidPolygon(f: Feature<any>): Feature<Polygon> | null {
   try {
-    const km = 0.02;
-    const bf = buffer(f, km, { units: "kilometers" });
-    if (!bf) return null;
+    if (!f || !f.geometry) return null;
 
-    const b = bboxFn(bf);
+    const km = 0.02; // ~20m
+    const degPad = km / 111; // grobe Umrechnung km -> Grad (reicht für kleines Padding)
 
-    return polygon([
-      [
-        [b[0], b[1]],
-        [b[2], b[1]],
-        [b[2], b[3]],
-        [b[0], b[3]],
-        [b[0], b[1]],
-      ],
-    ]);
+    // 1) Primär: bbox vom gepufferten Feature (funktioniert bei vielen Geometrien gut)
+    try {
+      const bf = buffer(f as any, km, { units: "kilometers" }) as any;
+      if (bf) {
+        const b = bboxFn(bf) as [number, number, number, number];
+        return polygon([
+          [
+            [b[0], b[1]],
+            [b[2], b[1]],
+            [b[2], b[3]],
+            [b[0], b[3]],
+            [b[0], b[1]],
+          ],
+        ]);
+      }
+    } catch {
+      // ignore -> fallback
+    }
+
+    // 2) Fallback: bbox direkt auf der Original-Geometrie + kleiner Padding
+    try {
+      const b0 = bboxFn(f as any) as [number, number, number, number];
+      const b: [number, number, number, number] = [
+        b0[0] - degPad,
+        b0[1] - degPad,
+        b0[2] + degPad,
+        b0[3] + degPad,
+      ];
+      return polygon([
+        [
+          [b[0], b[1]],
+          [b[2], b[1]],
+          [b[2], b[3]],
+          [b[0], b[3]],
+          [b[0], b[1]],
+        ],
+      ]);
+    } catch {
+      // ignore -> fallback
+    }
+
+    // 3) Letzter Fallback: centroid puffern
+    try {
+      const c = centroid(f as any);
+      const bf = buffer(c as any, km, { units: "kilometers" }) as any;
+      if (!bf) return null;
+      const b = bboxFn(bf) as [number, number, number, number];
+      return polygon([
+        [
+          [b[0], b[1]],
+          [b[2], b[1]],
+          [b[2], b[3]],
+          [b[0], b[3]],
+          [b[0], b[1]],
+        ],
+      ]);
+    } catch {
+      return null;
+    }
   } catch {
     return null;
   }
@@ -334,10 +385,12 @@ export async function POST(req: NextRequest) {
     let hardCollisions = 0;
 
     for (const obs of allObstacles) {
-      const obsId =
-        JSON.stringify(obs.geometry.coordinates).slice(0, 50) + (obs.properties?.id || "");
+      if (!obs || !obs.geometry) continue;
 
-      if (!booleanIntersects(routeBuffer, obs)) continue;
+      const obsId =
+        JSON.stringify((obs as any).geometry?.coordinates ?? "").slice(0, 50) + (obs.properties?.id || "");
+
+      if (!booleanIntersects(routeBuffer as any, obs as any)) continue;
 
       const p = obs.properties || {};
       const limits = getLimits(p);
@@ -394,10 +447,12 @@ export async function POST(req: NextRequest) {
       const routeBuffer = buffer(routeLine, 0.02, { units: "kilometers" });
 
       for (const obs of allObstacles) {
-        const obsId =
-          JSON.stringify(obs.geometry.coordinates).slice(0, 50) + (obs.properties?.id || "");
+        if (!obs || !obs.geometry) continue;
 
-        if (booleanIntersects(routeBuffer, obs)) {
+        const obsId =
+          JSON.stringify((obs as any).geometry?.coordinates ?? "").slice(0, 50) + (obs.properties?.id || "");
+
+        if (booleanIntersects(routeBuffer as any, obs as any)) {
           const p = obs.properties || {};
           const limits = getLimits(p);
           warnings.push({
@@ -405,7 +460,7 @@ export async function POST(req: NextRequest) {
             title: p.title || "Baustelle ohne Einschränkung",
             description: p.description,
             limits,
-            coords: centroid(obs).geometry.coordinates,
+            coords: centroid(obs as any).geometry.coordinates,
           });
           if (warnings.length > 20) break;
         }
