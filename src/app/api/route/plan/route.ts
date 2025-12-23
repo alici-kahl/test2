@@ -156,26 +156,21 @@ function isHardBlockedOrConflicting(
 }
 
 // --- FINALER FIX: NUR NOCH RECHTECKE ---
-// Diese Funktion wandelt JEDES Hindernis in ein simples Viereck um.
-// Das verhindert den "fetch failed" bei Valhalla, weil die Datenmenge winzig bleibt.
 function createAvoidPolygon(f: Feature<any>): Feature<Polygon> | null {
   try {
-    // 1. Kleiner Buffer (20m), damit Linien zu Flächen werden
     const km = 0.02;
     const bf = buffer(f, km, { units: "kilometers" });
     if (!bf) return null;
 
-    // 2. Wir nehmen NUR die Bounding Box.
-    // Keine komplexen Formen mehr. Nur 5 Punkte: [minX, minY, maxX, maxY]
     const b = bboxFn(bf);
 
     return polygon([
       [
-        [b[0], b[1]], // unten-links
-        [b[2], b[1]], // unten-rechts
-        [b[2], b[3]], // oben-rechts
-        [b[0], b[3]], // oben-links
-        [b[0], b[1]], // schließen
+        [b[0], b[1]],
+        [b[2], b[1]],
+        [b[2], b[3]],
+        [b[0], b[3]],
+        [b[0], b[1]],
       ],
     ]);
   } catch {
@@ -197,7 +192,6 @@ async function callValhalla(
       ? `https://${process.env.VERCEL_URL}`
       : "http://localhost:3000";
 
-    // Timeout auf 60 Sekunden erhöht
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 60000);
 
@@ -291,6 +285,10 @@ export async function POST(req: NextRequest) {
   let routeIsClean = false;
   let finalError: string | null = null;
 
+  // NEW: für Response/Debug
+  let lastHardCollisions = 0;
+  let lastAddedAvoids = 0;
+
   const valhallaBody = {
     start,
     end,
@@ -323,14 +321,15 @@ export async function POST(req: NextRequest) {
     fallbackRoute = result.geojson;
 
     const routeLine = currentRouteGeoJSON.features[0];
-    if (!routeLine || routeLine.geometry.type !== "LineString") break;
+    if (!routeLine || routeLine.geometry.type !== "LineString") {
+      finalError = "Invalid route geometry returned by Valhalla";
+      routeIsClean = false;
+      break;
+    }
 
-    // Buffer um Route
     // @ts-ignore
     const routeBuffer = buffer(routeLine, 0.015, { units: "kilometers" });
 
-    // --- BUG-3 FIX: Clean nur, wenn nachweislich ZERO harte Kollisionen existieren.
-    // Außerdem: Hindernisse werden IMMER weiter geprüft, auch wenn sie bereits "avoided" wurden.
     let addedAvoids = 0;
     let hardCollisions = 0;
 
@@ -345,12 +344,10 @@ export async function POST(req: NextRequest) {
       const title = p.title || p.description || "unknown";
 
       const { conflict, reasons } = isHardBlockedOrConflicting(limits, body.vehicle ?? {});
-
       if (!conflict) continue;
 
       hardCollisions++;
 
-      // Schon avoided, aber immer noch Kollision: NICHT "clean" werden lassen.
       if (avoidIds.has(obsId)) {
         console.warn(
           `[STILL COLLIDING AFTER AVOID] "${title.slice(0, 30)}..." -> ${reasons.join(", ")}`,
@@ -358,9 +355,7 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
-      console.log(
-        `[CONFLICT] "${title.slice(0, 30)}..." -> Reason: ${reasons.join(", ")}`,
-      );
+      console.log(`[CONFLICT] "${title.slice(0, 30)}..." -> Reason: ${reasons.join(", ")}`);
 
       const poly = createAvoidPolygon(obs);
       if (poly) {
@@ -370,9 +365,14 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // NEW: speichern für Response/Debug
+    lastHardCollisions = hardCollisions;
+    lastAddedAvoids = addedAvoids;
+
     if (hardCollisions === 0) {
       console.log(`[SUCCESS] Clean route found in iteration ${iterations}.`);
       routeIsClean = true;
+      finalError = null;
       break;
     }
 
@@ -397,9 +397,6 @@ export async function POST(req: NextRequest) {
         const obsId =
           JSON.stringify(obs.geometry.coordinates).slice(0, 50) + (obs.properties?.id || "");
 
-        // BUG-3 Debugging: Warnings sollen auch schon "avoided" Hindernisse zeigen.
-        // (Kein Skip mehr hier.)
-
         if (booleanIntersects(routeBuffer, obs)) {
           const p = obs.properties || {};
           const limits = getLimits(p);
@@ -407,7 +404,7 @@ export async function POST(req: NextRequest) {
             id: p.id ?? obsId,
             title: p.title || "Baustelle ohne Einschränkung",
             description: p.description,
-            limits, // now includes width/height/weight/axle/hard_block as numbers/bool or null
+            limits,
             coords: centroid(obs).geometry.coordinates,
           });
           if (warnings.length > 20) break;
@@ -416,16 +413,24 @@ export async function POST(req: NextRequest) {
     }
   } catch (e) {}
 
-  return NextResponse.json({
-    meta: {
-      source: "route/plan-v16-bbox-only",
-      iterations: iterations,
-      avoids_applied: activeAvoids.length,
-      clean: routeIsClean,
-      error: finalError,
+  // NEW: wenn nicht clean -> HTTP Fehlerstatus, damit Frontend es NICHT als "OK" behandelt
+  const statusCode = routeIsClean ? 200 : 409;
+
+  return NextResponse.json(
+    {
+      meta: {
+        source: "route/plan-v16-bbox-only",
+        iterations,
+        avoids_applied: activeAvoids.length,
+        clean: routeIsClean,
+        error: finalError,
+        hard_collisions: lastHardCollisions,
+        added_avoids_last_iter: lastAddedAvoids,
+      },
+      avoid_applied: { total: activeAvoids.length },
+      geojson: currentRouteGeoJSON,
+      warnings,
     },
-    avoid_applied: { total: activeAvoids.length },
-    geojson: currentRouteGeoJSON,
-    warnings: warnings,
-  });
+    { status: statusCode },
+  );
 }
