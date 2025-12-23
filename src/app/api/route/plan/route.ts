@@ -34,32 +34,125 @@ function makeSafeBBox(
   return bboxFn(buffered) as [number, number, number, number];
 }
 
-function getLimits(p: any) {
-  let width = p.max_width_m ?? p.max_width ?? p.width ?? p.width_limit ?? p.breite ?? null;
+/** robust: number parsing for values like "12,25", "3.5", 3.5 */
+function toNumOrNull(v: any): number | null {
+  if (v === null || v === undefined || v === "") return null;
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  const s = String(v).trim();
+  if (!s) return null;
+  const n = Number(s.replace(",", "."));
+  return Number.isFinite(n) ? n : null;
+}
+
+/** robust: true for true/1/"true"/"yes"/"ja" */
+function toBool(v: any): boolean {
+  if (v === true) return true;
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes" || s === "ja";
+}
+
+type Limits = {
+  width_m: number | null;
+  height_m: number | null;
+  weight_t: number | null;
+  axleload_t: number | null;
+  hard_block: boolean;
+};
+
+function getLimits(p: any): Limits {
+  // direct fields (various naming variants)
+  let width =
+    p.max_width_m ?? p.max_width ?? p.width ?? p.width_limit ?? p.breite ?? null;
+  let height =
+    p.max_height_m ?? p.max_height ?? p.height ?? p.height_limit ?? p.hoehe ?? null;
   let weight =
     p.max_weight_t ?? p.max_weight ?? p.weight ?? p.weight_limit ?? p.gewicht ?? null;
-  const text = `${p.title || ""} ${p.description || ""} ${p.reason || ""} ${
-    p.subtitle || ""
-  }`;
+  let axle =
+    p.max_axleload_t ?? p.max_axle_t ?? p.axleload_t ?? p.axle_load_t ?? p.axleload ?? p.achslast ?? null;
 
-  if (!width || width > 900) {
+  const hard =
+    toBool(p.hard_block) ||
+    toBool(p.hardblock) ||
+    toBool(p.closed) ||
+    toBool(p.blocked) ||
+    toBool(p.road_closed);
+
+  const text = `${p.title || ""} ${p.description || ""} ${p.reason || ""} ${p.subtitle || ""}`;
+
+  // try to extract width from text if missing
+  if (toNumOrNull(width) === null) {
     const wMatch =
       text.match(/(?:Breite|width|breite)[^0-9]*([0-9]+(?:[.,][0-9]+)?)\s*m/i) ||
       text.match(/([0-9]+(?:[.,][0-9]+)?)\s*m\s*(?:Breite|width|breite)/i) ||
       text.match(/(?:über|over|width)\s*([0-9]+(?:[.,][0-9]+)?)\s*m/i);
-    if (wMatch) width = parseFloat(wMatch[1].replace(",", "."));
+    if (wMatch) width = wMatch[1];
   }
-  if (!weight || weight > 900) {
+
+  // try to extract height from text if missing
+  if (toNumOrNull(height) === null) {
+    const hMatch =
+      text.match(/(?:Höhe|Hoehe|height)[^0-9]*([0-9]+(?:[.,][0-9]+)?)\s*m/i) ||
+      text.match(/([0-9]+(?:[.,][0-9]+)?)\s*m\s*(?:Höhe|Hoehe|height)/i);
+    if (hMatch) height = hMatch[1];
+  }
+
+  // try to extract weight from text if missing
+  if (toNumOrNull(weight) === null) {
     const wtMatch = text.match(
       /(?:Gewicht|weight|Last|last)[^0-9]*([0-9]+(?:[.,][0-9]+)?)\s*t/i,
     );
-    if (wtMatch) weight = parseFloat(wtMatch[1].replace(",", "."));
+    if (wtMatch) weight = wtMatch[1];
   }
 
-  if (width === 0) width = 999;
-  if (weight === 0) weight = 999;
+  // try to extract axle load from text if missing (rare, but safe)
+  if (toNumOrNull(axle) === null) {
+    const aMatch =
+      text.match(/(?:Achslast|axle)[^0-9]*([0-9]+(?:[.,][0-9]+)?)\s*t/i);
+    if (aMatch) axle = aMatch[1];
+  }
 
-  return { width: width ?? 999, weight: weight ?? 999 };
+  return {
+    width_m: toNumOrNull(width),
+    height_m: toNumOrNull(height),
+    weight_t: toNumOrNull(weight),
+    axleload_t: toNumOrNull(axle),
+    hard_block: hard,
+  };
+}
+
+/**
+ * Hard conflict if:
+ * - hard_block/closed
+ * - or vehicle exceeds any present limit
+ */
+function isHardBlockedOrConflicting(
+  limits: Limits,
+  vehicle: { width_m?: number; height_m?: number; weight_t?: number; axleload_t?: number },
+) {
+  if (limits.hard_block) {
+    return { conflict: true, reasons: ["hard_block/closed"] as string[] };
+  }
+
+  const reasons: string[] = [];
+  const vw = toNumOrNull(vehicle.width_m);
+  const vh = toNumOrNull(vehicle.height_m);
+  const vwt = toNumOrNull(vehicle.weight_t);
+  const va = toNumOrNull(vehicle.axleload_t);
+
+  if (vw !== null && limits.width_m !== null && vw > limits.width_m) {
+    reasons.push(`Width ${vw} > ${limits.width_m}`);
+  }
+  if (vh !== null && limits.height_m !== null && vh > limits.height_m) {
+    reasons.push(`Height ${vh} > ${limits.height_m}`);
+  }
+  if (vwt !== null && limits.weight_t !== null && vwt > limits.weight_t) {
+    reasons.push(`Weight ${vwt} > ${limits.weight_t}`);
+  }
+  if (va !== null && limits.axleload_t !== null && va > limits.axleload_t) {
+    reasons.push(`Axle ${va} > ${limits.axleload_t}`);
+  }
+
+  return { conflict: reasons.length > 0, reasons };
 }
 
 // --- FINALER FIX: NUR NOCH RECHTECKE ---
@@ -251,33 +344,23 @@ export async function POST(req: NextRequest) {
       const limits = getLimits(p);
       const title = p.title || p.description || "unknown";
 
-      let isConflict = false;
-      const reasons: string[] = [];
+      const { conflict, reasons } = isHardBlockedOrConflicting(limits, body.vehicle ?? {});
 
-      if (limits.width < 900 && limits.width < vWidth) {
-        isConflict = true;
-        reasons.push(`Width ${limits.width} < ${vWidth}`);
-      }
-      if (!isConflict && limits.weight < 900 && limits.weight < vWeight) {
-        isConflict = true;
-        reasons.push(`Weight ${limits.weight} < ${vWeight}`);
-      }
-
-      if (!isConflict) continue;
+      if (!conflict) continue;
 
       hardCollisions++;
 
       // Schon avoided, aber immer noch Kollision: NICHT "clean" werden lassen.
       if (avoidIds.has(obsId)) {
         console.warn(
-          `[STILL COLLIDING AFTER AVOID] "${title.slice(0, 30)}..." -> ${reasons.join(
-            ", ",
-          )}`,
+          `[STILL COLLIDING AFTER AVOID] "${title.slice(0, 30)}..." -> ${reasons.join(", ")}`,
         );
         continue;
       }
 
-      console.log(`[CONFLICT] "${title.slice(0, 30)}..." -> Reason: ${reasons.join(", ")}`);
+      console.log(
+        `[CONFLICT] "${title.slice(0, 30)}..." -> Reason: ${reasons.join(", ")}`,
+      );
 
       const poly = createAvoidPolygon(obs);
       if (poly) {
@@ -319,11 +402,12 @@ export async function POST(req: NextRequest) {
 
         if (booleanIntersects(routeBuffer, obs)) {
           const p = obs.properties || {};
+          const limits = getLimits(p);
           warnings.push({
             id: p.id ?? obsId,
             title: p.title || "Baustelle ohne Einschränkung",
             description: p.description,
-            limits: getLimits(p),
+            limits, // now includes width/height/weight/axle/hard_block as numbers/bool or null
             coords: centroid(obs).geometry.coordinates,
           });
           if (warnings.length > 20) break;
