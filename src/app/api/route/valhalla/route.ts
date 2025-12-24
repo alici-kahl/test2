@@ -11,27 +11,33 @@ type VehicleSpec = {
   axleload_t?: number;
 };
 
+// --- Polyline6 decoder (Valhalla uses polyline6 by default)
 function decodePolyline6(str: string): [number, number][] {
-  let index = 0,
-    lat = 0,
-    lng = 0;
+  let index = 0;
+  let lat = 0;
+  let lon = 0;
   const coordinates: [number, number][] = [];
-  const shiftAndMask = () => {
-    let result = 0,
-      shift = 0,
-      b: number;
+
+  const nextValue = () => {
+    let result = 0;
+    let shift = 0;
+    let b: number;
     do {
       b = str.charCodeAt(index++) - 63;
       result |= (b & 0x1f) << shift;
       shift += 5;
     } while (b >= 0x20);
-    return result & 1 ? ~(result >> 1) : result >> 1;
+    const delta = (result & 1) ? ~(result >> 1) : (result >> 1);
+    return delta;
   };
+
   while (index < str.length) {
-    lat += shiftAndMask();
-    lng += shiftAndMask();
-    coordinates.push([lng / 1e6, lat / 1e6]);
+    lat += nextValue();
+    lon += nextValue();
+    // 1e6 because polyline6
+    coordinates.push([lon / 1e6, lat / 1e6]);
   }
+
   return coordinates;
 }
 
@@ -45,30 +51,75 @@ function toFeatureLine(coords: [number, number][], properties: any = {}) {
 
 function valhallaToGeoJSON(response: any) {
   const trip = response?.trip;
-  if (!trip) return { type: "FeatureCollection", features: [] as any[] };
+  if (!trip) return { type: "FeatureCollection" as const, features: [] as any[] };
+
+  const legs = trip?.legs || [];
   const features: any[] = [];
-  (trip.legs || []).forEach((leg: any, idx: number) => {
-    const coords = decodePolyline6(leg.shape || "");
-    const summary = leg.summary || {};
-    const props: any = {
-      leg_index: idx,
-      summary: {
-        distance_km: Number(summary.length || 0),
-        duration_s: Number(summary.time || 0),
-      },
-      maneuvers: (leg.maneuvers || []).map((m: any) => ({
-        instruction: m.instruction,
-        distance_km: Number(m.length || 0),
-        duration_s: Number(m.time || 0),
-        street_names: m.street_names || [],
-      })),
-      streets_sequence: (leg.maneuvers || [])
-        .flatMap((m: any) => m.street_names || [])
-        .filter(Boolean),
-    };
-    features.push(toFeatureLine(coords, props));
-  });
+
+  for (let i = 0; i < legs.length; i++) {
+    const leg = legs[i];
+    const shape: string | undefined = leg?.shape;
+
+    // Valhalla sometimes returns "shape" + "shape_format". We assume polyline6.
+    const coords = shape ? decodePolyline6(shape) : [];
+    features.push(
+      toFeatureLine(coords, {
+        leg_index: i,
+        summary: leg?.summary ?? null,
+        maneuvers: leg?.maneuvers ?? [],
+      }),
+    );
+  }
+
   return { type: "FeatureCollection" as const, features };
+}
+
+// --- Normalize incoming avoid polygons to GeoJSON geometries (Polygon / MultiPolygon)
+type GeoJSONGeometry =
+  | { type: "Polygon"; coordinates: number[][][] }
+  | { type: "MultiPolygon"; coordinates: number[][][][] };
+
+function isPolyGeom(g: any): g is GeoJSONGeometry {
+  return (
+    g &&
+    (g.type === "Polygon" || g.type === "MultiPolygon") &&
+    Array.isArray(g.coordinates)
+  );
+}
+
+function collectGeoms(input: any): GeoJSONGeometry[] {
+  const out: GeoJSONGeometry[] = [];
+
+  const pushGeom = (g: any) => {
+    if (isPolyGeom(g)) out.push(g);
+  };
+
+  if (!input) return out;
+
+  // 1) Array of geometries/features
+  if (Array.isArray(input)) {
+    for (const x of input) {
+      if (isPolyGeom(x)) pushGeom(x);
+      else if (x?.geometry) pushGeom(x.geometry);
+    }
+    return out;
+  }
+
+  // 2) FeatureCollection
+  if (input?.type === "FeatureCollection" && Array.isArray(input.features)) {
+    for (const f of input.features) pushGeom(f?.geometry);
+    return out;
+  }
+
+  // 3) Single Feature
+  if (input?.type === "Feature" && input?.geometry) {
+    pushGeom(input.geometry);
+    return out;
+  }
+
+  // 4) Single geometry
+  pushGeom(input);
+  return out;
 }
 
 function buildValhallaRequest(
@@ -76,13 +127,14 @@ function buildValhallaRequest(
   end: Coords,
   v: VehicleSpec,
   options: {
-    exclude_polygons?: any[];
+    exclude_polygons?: GeoJSONGeometry[];
     directions_language?: string;
     alternates?: number;
   } = {},
 ) {
   const costing = "truck";
-  const hasExcludes = Array.isArray(options.exclude_polygons) && options.exclude_polygons.length > 0;
+  const hasExcludes =
+    Array.isArray(options.exclude_polygons) && options.exclude_polygons.length > 0;
 
   const truckCosting: any = {
     width: v.width_m ?? 2.55,
@@ -90,12 +142,11 @@ function buildValhallaRequest(
     weight: (v.weight_t ?? 40) * 1000,
     axle_load: (v.axleload_t ?? 10) * 1000,
 
-    // Autobahn stark bevorzugen (nicht 100% "nur motorway", aber nahe dran)
+    // Autobahn stark bevorzugen
     use_highways: 1.0,
     shortest: false,
 
-    // Wenn Excludes aktiv sind, machen wir Abbiegen/Service/Gates sehr teuer,
-    // aber NICHT so, dass der Request „kaputt“ wird.
+    // Bei Excludes: Detour erzwingen, aber nicht "Request kaputt" machen
     maneuver_penalty: hasExcludes ? 2000 : 5,
     gate_penalty: hasExcludes ? 10_000_000 : 300,
     service_penalty: hasExcludes ? 10_000_000 : 0,
@@ -118,9 +169,11 @@ function buildValhallaRequest(
     alternates: options.alternates ?? 1,
   };
 
-  // WICHTIG: Valhalla erwartet exclude_polygons
+  // IMPORTANT:
+  // Different Valhalla builds/clients vary; we set BOTH keys defensively.
   if (hasExcludes) {
     json.exclude_polygons = options.exclude_polygons;
+    json.avoid_polygons = options.exclude_polygons;
   }
 
   return json;
@@ -133,19 +186,8 @@ export async function POST(req: NextRequest) {
   const end: Coords = body.end ?? [8.68, 50.11];
   const vehicle: VehicleSpec = body.vehicle ?? {};
 
-  // Normalisiere alles auf „GeoJSON Geometry Objects“
-  const geoms: any[] = [];
-  const pushGeom = (x: any) => {
-    if (!x) return;
-    if (x.type === "Polygon" || x.type === "MultiPolygon") geoms.push(x);
-    else if (x.geometry && (x.geometry.type === "Polygon" || x.geometry.type === "MultiPolygon"))
-      geoms.push(x.geometry);
-  };
-
-  if (body.avoid_polygons) {
-    if (Array.isArray(body.avoid_polygons)) body.avoid_polygons.forEach(pushGeom);
-    else if (body.avoid_polygons.features) body.avoid_polygons.features.forEach((f: any) => pushGeom(f));
-  }
+  // Accept body.avoid_polygons in many shapes (array, FeatureCollection, Feature, geometry)
+  const geoms = collectGeoms(body.avoid_polygons);
 
   const valhallaURL = process.env.VALHALLA_URL || "http://localhost:8002/route";
   const requestJson = buildValhallaRequest(start, end, vehicle, {
@@ -164,18 +206,31 @@ export async function POST(req: NextRequest) {
       body: JSON.stringify(requestJson),
       signal: controller.signal,
     });
+
     clearTimeout(timeout);
 
+    // Always return JSON (prevents "Unexpected token ..." in the browser)
     if (!vr.ok) {
-      const text = await vr.text();
-      return NextResponse.json({ error: text, status: vr.status }, { status: 500 });
+      const text = await vr.text().catch(() => "");
+      return NextResponse.json(
+        { error: text || "Valhalla request failed", status: vr.status, request_had_excludes: geoms.length > 0 },
+        { status: 500 },
+      );
     }
 
     const parsed = await vr.json();
     const fc = valhallaToGeoJSON(parsed);
-    return NextResponse.json({ exclude_count: geoms.length, geojson: fc });
+
+    return NextResponse.json({
+      exclude_count: geoms.length,
+      geojson: fc,
+      raw: body.debug_raw ? parsed : undefined,
+    });
   } catch (e: any) {
     clearTimeout(timeout);
-    return NextResponse.json({ error: String(e), type: "FetchError" }, { status: 500 });
+    return NextResponse.json(
+      { error: String(e), type: "FetchError", request_had_excludes: geoms.length > 0 },
+      { status: 500 },
+    );
   }
 }
