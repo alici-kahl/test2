@@ -239,6 +239,40 @@ export async function POST(req: NextRequest) {
 
   let fallbackRoute: FeatureCollection | null = null;
 
+  // NEU: Hilfsfunktion – prüft, ob auf der aktuellen Route noch blockierende Treffer liegen
+  function scanBlockingOnRoute(routeBuffer: any): { count: number; examples: any[] } {
+    const examples: any[] = [];
+    let count = 0;
+
+    for (const obs of allObstacles) {
+      if (!booleanIntersects(routeBuffer, obs)) continue;
+
+      const p = obs.properties || {};
+      const limits = getLimits(p);
+
+      const blockedByWidth = limits.width < 900 && limits.width < vWidth;
+      const blockedByWeight = limits.weight < 900 && limits.weight < vWeight;
+
+      if (blockedByWidth || blockedByWeight) {
+        count++;
+        if (examples.length < 10) {
+          const reasons: string[] = [];
+          if (blockedByWidth) reasons.push(`Width ${limits.width} < ${vWidth}`);
+          if (blockedByWeight) reasons.push(`Weight ${limits.weight} < ${vWeight}`);
+          examples.push({
+            title: p.title || p.description || "unknown",
+            description: p.description,
+            limits,
+            coords: centroid(obs).geometry.coordinates,
+            reasons,
+            already_avoided: avoidIds.has(stableObsId(obs)),
+          });
+        }
+      }
+    }
+    return { count, examples };
+  }
+
   while (iterations < MAX_ITERATIONS) {
     iterations++;
     console.log(`--- ITERATION ${iterations} (Avoids: ${activeAvoids.length}) ---`);
@@ -278,6 +312,7 @@ export async function POST(req: NextRequest) {
 
     let newConflictsFound = 0;
 
+    // A) Versuche neue Avoids hinzuzufügen (nur einmal pro Obstacle)
     for (const obs of allObstacles) {
       const obsId = stableObsId(obs);
       if (avoidIds.has(obsId)) continue;
@@ -287,20 +322,16 @@ export async function POST(req: NextRequest) {
         const limits = getLimits(p);
         const title = p.title || p.description || "unknown";
 
-        // Blockade-Entscheidung (nur width/weight, wie bisher; aber jetzt konsistent)
-        const reasons: string[] = [];
         const blockedByWidth = limits.width < 900 && limits.width < vWidth;
         const blockedByWeight = limits.weight < 900 && limits.weight < vWeight;
 
-        if (blockedByWidth) reasons.push(`Width ${limits.width} < ${vWidth}`);
-        if (blockedByWeight) reasons.push(`Weight ${limits.weight} < ${vWeight}`);
+        if (blockedByWidth || blockedByWeight) {
+          const reasons: string[] = [];
+          if (blockedByWidth) reasons.push(`Width ${limits.width} < ${vWidth}`);
+          if (blockedByWeight) reasons.push(`Weight ${limits.weight} < ${vWeight}`);
 
-        const isBlocked = reasons.length > 0;
-
-        if (isBlocked) {
           console.log(`[BLOCK] "${title.slice(0, 60)}" -> ${reasons.join(", ")}`);
 
-          // Wir merken uns blockierende Treffer (für Rückgabe/Debug)
           blockedFindings.push({
             title,
             description: p.description,
@@ -328,15 +359,32 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // wenn innerer loop wegen limit abgebrochen hat
     if (finalError) break;
 
-    if (newConflictsFound === 0) {
-      console.log(`[SUCCESS] No new blocking conflicts in iteration ${iterations}.`);
-      // "clean" bestimmen wir final anhand von Warnings/Findings (sicherer)
+    // B) WICHTIGER FIX: „clean“ erst dann, wenn wirklich keine blockierenden Treffer mehr auf der Route liegen
+    const blockingScan = scanBlockingOnRoute(routeBuffer);
+
+    if (blockingScan.count === 0) {
+      console.log(`[SUCCESS] Route has no blocking obstacles in iteration ${iterations}.`);
       routeIsClean = true;
       break;
     }
+
+    // Wenn wir keine neuen Avoids mehr hinzufügen konnten, aber weiterhin blockierende Treffer da sind,
+    // dann ist das System "stuck" -> sauber BLOCKED zurückgeben (statt clean=true).
+    if (newConflictsFound === 0) {
+      finalError =
+        "Route remains blocked after applying avoids (no further progress possible).";
+      console.error(`[BLOCKED] ${finalError}`);
+
+      // Ergänze Beispiele, damit UI/Debug klar ist, was blockiert (max. 10)
+      blockedFindings.push(...blockingScan.examples);
+
+      routeIsClean = false;
+      break;
+    }
+
+    // Sonst: nächste Iteration versuchen (mit neu hinzugefügten Avoids)
   }
 
   /* 3. Warnings (und: blockierende Warnings erzwingen BLOCKED) */
@@ -350,41 +398,37 @@ export async function POST(req: NextRequest) {
       const routeBuffer = buffer(routeLine, ROUTE_BUFFER_KM, { units: "kilometers" });
 
       for (const obs of allObstacles) {
-        const obsId = stableObsId(obs);
-        if (avoidIds.has(obsId)) continue;
+        // FIX: NICHT mehr „continue“ bei avoidIds.
+        // Wir müssen final prüfen, ob eine zuvor "avoided" Baustelle trotzdem noch auf der Route liegt.
+        const p = obs.properties || {};
+        const limits = getLimits(p);
 
-        if (booleanIntersects(routeBuffer, obs)) {
-          const p = obs.properties || {};
-          const limits = getLimits(p);
+        if (!booleanIntersects(routeBuffer, obs)) continue;
 
-          const title = p.title || "Baustelle/Restriktion";
-          const c = centroid(obs).geometry.coordinates;
+        const title = p.title || "Baustelle/Restriktion";
+        const c = centroid(obs).geometry.coordinates;
 
-          const reasons: string[] = [];
-          const blockedByWidth = limits.width < 900 && limits.width < vWidth;
-          const blockedByWeight = limits.weight < 900 && limits.weight < vWeight;
+        const reasons: string[] = [];
+        const blockedByWidth = limits.width < 900 && limits.width < vWidth;
+        const blockedByWeight = limits.weight < 900 && limits.weight < vWeight;
 
-          if (blockedByWidth) reasons.push(`Width ${limits.width} < ${vWidth}`);
-          if (blockedByWeight) reasons.push(`Weight ${limits.weight} < ${vWeight}`);
+        if (blockedByWidth) reasons.push(`Width ${limits.width} < ${vWidth}`);
+        if (blockedByWeight) reasons.push(`Weight ${limits.weight} < ${vWeight}`);
 
-          const entry = {
-            title,
-            description: p.description,
-            limits,
-            coords: c,
-            blocking: reasons.length > 0,
-            reasons: reasons.length > 0 ? reasons : undefined,
-          };
+        const entry = {
+          title,
+          description: p.description,
+          limits,
+          coords: c,
+          blocking: reasons.length > 0,
+          reasons: reasons.length > 0 ? reasons : undefined,
+          already_avoided: avoidIds.has(stableObsId(obs)),
+        };
 
-          if (entry.blocking) {
-            blockingWarnings.push(entry);
-          } else {
-            warnings.push(entry);
-          }
+        if (entry.blocking) blockingWarnings.push(entry);
+        else warnings.push(entry);
 
-          // Sicherheitsgrenze
-          if (warnings.length + blockingWarnings.length > 40) break;
-        }
+        if (warnings.length + blockingWarnings.length > 40) break;
       }
     }
   } catch {}
@@ -418,13 +462,8 @@ export async function POST(req: NextRequest) {
     avoid_applied: { total: activeAvoids.length },
     geojson: currentRouteGeoJSON,
 
-    // non-blocking intersects
     warnings,
-
-    // NEW: blockierende intersects (das ist der Fix für deinen 9m/8.85m Fall)
     blocking_warnings: blockingWarnings,
-
-    // optional: was im Loop als blockierend erkannt wurde (kann du später entfernen)
     blocked_findings: blockedFindings.slice(0, 20),
   });
 }
