@@ -38,7 +38,8 @@ function toFeatureLine(coords: [number, number][], properties: any = {}) {
 
 function valhallaToGeoJSON(response: any) {
   const trip = response?.trip;
-  if (!trip) return { type: "FeatureCollection", features: [] };
+  if (!trip) return { type: "FeatureCollection", features: [] as any[] };
+
   const features: any[] = [];
   (trip.legs || []).forEach((leg: any, idx: number) => {
     const coords = decodePolyline6(leg.shape || "");
@@ -56,6 +57,7 @@ function valhallaToGeoJSON(response: any) {
     };
     features.push(toFeatureLine(coords, props));
   });
+
   return { type: "FeatureCollection" as const, features };
 }
 
@@ -63,25 +65,21 @@ function buildValhallaRequest(
   start: Coords,
   end: Coords,
   v: VehicleSpec,
-  options: { avoid_polygons?: any[]; directions_language?: string; alternates?: number; } = {}
+  options: { avoid_polygons?: any[]; directions_language?: string; alternates?: number } = {}
 ) {
   const costing = "truck";
   const hasAvoids = Array.isArray(options.avoid_polygons) && options.avoid_polygons.length > 0;
 
-  // Mehr Freiheit bei Avoids:
-  // - Penalties bleiben hoch, aber nicht "Atombombe" (sonst endet man viel zu oft in NO ROUTE)
-  // - use_highways leicht reduzieren, damit Nebenstrecken eher als Umfahrung gewählt werden dürfen
   const truckCosting: any = {
     width: v.width_m ?? 2.55,
     height: v.height_m ?? 4.0,
     weight: (v.weight_t ?? 40) * 1000,
     axle_load: (v.axleload_t ?? 10) * 1000,
 
+    // Avoids: stark, aber routbar
     use_highways: hasAvoids ? 0.7 : 1.0,
     shortest: false,
 
-    // vorher: hasAvoids ? 2000 / 10_000_000 / 10_000_000
-    // jetzt: immer noch deutlich, aber routbar
     maneuver_penalty: hasAvoids ? 250 : 5,
     gate_penalty: hasAvoids ? 50_000 : 300,
     service_penalty: hasAvoids ? 50_000 : 0,
@@ -122,9 +120,12 @@ export async function POST(req: NextRequest) {
     else if (x.geometry) geoms.push(x.geometry);
   };
 
-  if (body.avoid_polygons) {
-    if (Array.isArray(body.avoid_polygons)) body.avoid_polygons.forEach(pushGeom);
-    else if (body.avoid_polygons.features) body.avoid_polygons.features.forEach((f: any) => pushGeom(f));
+  // akzeptiere beide keys
+  const srcAvoid = body.avoid_polygons ?? body.exclude_polygons;
+
+  if (srcAvoid) {
+    if (Array.isArray(srcAvoid)) srcAvoid.forEach(pushGeom);
+    else if (srcAvoid.features) srcAvoid.features.forEach((f: any) => pushGeom(f));
   }
 
   const valhallaURL = process.env.VALHALLA_URL || "http://localhost:8002/route";
@@ -153,7 +154,12 @@ export async function POST(req: NextRequest) {
 
     const parsed = await vr.json();
     const fc = valhallaToGeoJSON(parsed);
-    return NextResponse.json({ avoid_count: geoms.length, geojson: fc });
+
+    return NextResponse.json({
+      avoid_count: geoms.length,
+      raw_status: parsed?.trip?.status ?? null,
+      geojson: fc,
+    });
   } catch (e: any) {
     clearTimeout(timeout);
     return NextResponse.json({ error: String(e), type: "FetchError" }, { status: 500 });
