@@ -1,4 +1,4 @@
-/* app/api/route/plan/route.ts */
+/* src/app/api/route/plan/route.ts */
 
 import { NextRequest, NextResponse } from "next/server";
 import bboxFn from "@turf/bbox";
@@ -27,6 +27,8 @@ type PlanReq = {
   respect_direction?: boolean;
 };
 
+/* ---------- Helpers ---------- */
+
 function makeSafeBBox(start: Coords, end: Coords, bufferKm: number): [number, number, number, number] {
   const line = lineString([start, end]);
   const buffered = buffer(line, bufferKm, { units: "kilometers" });
@@ -34,7 +36,6 @@ function makeSafeBBox(start: Coords, end: Coords, bufferKm: number): [number, nu
 }
 
 function getLimits(p: any) {
-  // Roadworks: max_width_m; Restrictions ggf. anders – wir bleiben minimal, aber robust
   const width =
     (typeof p?.max_width_m === "number" ? p.max_width_m : null) ??
     (typeof p?.max_width === "number" ? p.max_width : null) ??
@@ -45,32 +46,28 @@ function getLimits(p: any) {
     (typeof p?.max_weight === "number" ? p.max_weight : null) ??
     999;
 
-  return { width: width === 0 ? 999 : width, weight: weight === 0 ? 999 : weight };
+  return {
+    width: width === 0 ? 999 : width,
+    weight: weight === 0 ? 999 : weight,
+  };
 }
 
 function stableObsId(obs: Feature<any>): string {
   const p: any = obs.properties || {};
-  // bevorzugt echte IDs
-  const id = p.roadwork_id ?? p.external_id ?? p.restriction_id ?? p.id;
-  if (id) return String(id);
-  // fallback
-  return JSON.stringify(bboxFn(obs));
+  return String(p.roadwork_id ?? p.external_id ?? p.restriction_id ?? p.id ?? JSON.stringify(bboxFn(obs)));
 }
 
 function createAvoidPolygon(f: Feature<any>): Feature<Polygon> | null {
   try {
-    // kleiner Buffer (20m) => bbox => Rechteck (Valhalla-freundlich)
-    const bf = buffer(f, 0.02, { units: "kilometers" });
+    const bf = buffer(f, 0.02, { units: "kilometers" }); // 20m
     const b = bboxFn(bf);
-    return polygon([
-      [
-        [b[0], b[1]],
-        [b[2], b[1]],
-        [b[2], b[3]],
-        [b[0], b[3]],
-        [b[0], b[1]],
-      ],
-    ]);
+    return polygon([[
+      [b[0], b[1]],
+      [b[2], b[1]],
+      [b[2], b[3]],
+      [b[0], b[3]],
+      [b[0], b[1]],
+    ]]);
   } catch {
     return null;
   }
@@ -79,10 +76,12 @@ function createAvoidPolygon(f: Feature<any>): Feature<Polygon> | null {
 async function callValhalla(reqBody: any, avoidPolys: Feature<Polygon>[]) {
   const payload = {
     ...reqBody,
-    avoid_polygons: avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined,
+    avoid_polygons: avoidPolys.length ? avoidPolys.map(p => p.geometry) : undefined,
   };
 
-  const host = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "http://localhost:3000";
+  const host = process.env.VERCEL_URL
+    ? `https://${process.env.VERCEL_URL}`
+    : "http://localhost:3000";
 
   const res = await fetch(`${host}/api/route/valhalla`, {
     method: "POST",
@@ -91,213 +90,145 @@ async function callValhalla(reqBody: any, avoidPolys: Feature<Polygon>[]) {
   });
 
   if (!res.ok) {
-    const txt = await res.text();
-    return { geojson: { type: "FeatureCollection", features: [] }, error: txt || `Valhalla ${res.status}` };
+    return { geojson: { type: "FeatureCollection", features: [] }, error: await res.text() };
   }
 
   return await res.json();
 }
 
-async function postJSON<T>(origin: string, path: string, body: any, timeoutMs = 8000): Promise<T | null> {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-
+async function postJSON<T>(origin: string, path: string, body: any): Promise<T | null> {
   try {
     const r = await fetch(`${origin}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-      signal: ctrl.signal,
     });
     if (!r.ok) return null;
     return (await r.json()) as T;
   } catch {
     return null;
-  } finally {
-    clearTimeout(t);
   }
 }
+
+/* ---------- Main ---------- */
 
 export async function POST(req: NextRequest) {
   const body = (await req.json().catch(() => ({}))) as PlanReq;
 
   const start = body.start;
   const end = body.end;
+
   const ts = body.ts ?? new Date().toISOString();
   const tz = body.tz ?? "Europe/Berlin";
 
   const vWidth = body.vehicle?.width_m ?? 2.55;
   const vWeight = body.vehicle?.weight_t ?? 40;
 
-  const valhallaSoftMax = Number.isFinite(body.valhalla_soft_max as any) ? (body.valhalla_soft_max as number) : 80;
   const MAX_ITERATIONS = 6;
-
-  // 20m Buffer um Route für Intersections
   const ROUTE_BUFFER_KM = 0.02;
+  const valhallaSoftMax = body.valhalla_soft_max ?? 80;
 
-  // Suchraum (50km) – kannst du später feintunen
   const bbox = makeSafeBBox(start, end, 50);
-
   const origin = req.nextUrl.origin;
-
-  // WICHTIG: Roadworks/Restrictions so laden wie dein System es erwartet (ts/tz/bbox/only_motorways/buffer_m)
-  const roadworksPayload = {
-    ts,
-    tz,
-    bbox,
-    buffer_m: body.roadworks?.buffer_m ?? 60,
-    only_motorways: body.roadworks?.only_motorways ?? true,
-  };
-
-  const restrictionsPayload = {
-    ts,
-    tz,
-    bbox,
-    buffer_m: 10,
-    simplify_m: 5,
-    min_area_m2: 20,
-    max_polygons: 1000,
-    vehicle: body.vehicle,
-  };
 
   const obstacles: Feature<any>[] = [];
 
-  const rw = await postJSON<{ type: string; features: Feature<any>[] }>(origin, "/api/roadworks", roadworksPayload, 8000);
+  const rw = await postJSON<{ features: Feature<any>[] }>(origin, "/api/roadworks", {
+    ts, tz, bbox,
+    buffer_m: body.roadworks?.buffer_m ?? 60,
+    only_motorways: body.roadworks?.only_motorways ?? true,
+  });
+
   if (rw?.features?.length) obstacles.push(...rw.features);
 
-  const rs = await postJSON<{ geojson?: { features?: Feature<any>[] } }>(origin, "/api/restrictions", restrictionsPayload, 8000);
-  if (rs?.geojson?.features?.length) obstacles.push(...rs.geojson.features);
-
   let avoids: Feature<Polygon>[] = [];
-  const avoidIds = new Set<string>();
-
+  let avoidIds = new Set<string>();
   let iterations = 0;
   let routeIsClean = false;
   let finalError: string | null = null;
-
   let route: FeatureCollection = { type: "FeatureCollection", features: [] };
-
-  // für UI/Debug
   const blockingWarnings: any[] = [];
 
   while (iterations < MAX_ITERATIONS) {
     iterations++;
 
-    const valhallaReq = {
+    const res = await callValhalla({
       start,
       end,
       vehicle: body.vehicle,
       alternates: body.alternates ?? 1,
       directions_language: body.directions_language ?? "de-DE",
       respect_direction: body.respect_direction ?? true,
-    };
-
-    const res = await callValhalla(valhallaReq, avoids);
+    }, avoids);
 
     if (!res?.geojson?.features?.length) {
-      finalError = res?.error || "No route found";
-      routeIsClean = false;
+      finalError = res?.error ?? "No route found";
       break;
     }
 
     route = res.geojson;
-
     const line = route.features[0];
-    // @ts-ignore
-    const routeBuffer = buffer(line, ROUTE_BUFFER_KM, { units: "kilometers" });
+    const routeBuffer = buffer(line as any, ROUTE_BUFFER_KM, { units: "kilometers" });
 
-    let blockedCount = 0;
-    let addedAvoids = 0;
+    let blocked = 0;
+    let added = 0;
 
-    // Scan aktuelle Route gegen Obstacles
     for (const obs of obstacles) {
       if (!booleanIntersects(routeBuffer, obs)) continue;
-
       const limits = getLimits(obs.properties);
-      const blocked = (limits.width < vWidth) || (limits.weight < vWeight);
+      if (limits.width >= vWidth && limits.weight >= vWeight) continue;
 
-      if (!blocked) continue;
-
-      blockedCount++;
-
+      blocked++;
       const id = stableObsId(obs);
-
-      // Nur neue Avoids hinzufügen
       if (!avoidIds.has(id)) {
         const poly = createAvoidPolygon(obs);
         if (poly) {
           avoids.push(poly);
           avoidIds.add(id);
-          addedAvoids++;
+          added++;
         }
       }
     }
 
-    // Wenn keine blockierenden Treffer mehr => CLEAN
-    if (blockedCount === 0) {
+    if (blocked === 0) {
       routeIsClean = true;
-      finalError = null;
       break;
     }
 
-    // Wenn blockiert, aber keine neuen Avoids mehr möglich => stuck => BLOCKED
-    if (blockedCount > 0 && addedAvoids === 0) {
-      routeIsClean = false;
+    if (added === 0) {
       finalError = "Route blocked - no valid detour possible";
       break;
     }
 
-    // Hard cap
     if (avoids.length >= valhallaSoftMax) {
-      routeIsClean = false;
-      finalError = `Avoid polygon limit hit (${avoids.length} >= ${valhallaSoftMax})`;
+      finalError = "Avoid polygon limit hit";
       break;
     }
-
-    // sonst: nächste Iteration mit mehr Avoids
   }
 
-  // FINALER HARD CHECK: Endroute darf niemals als clean rausgehen, wenn sie noch blockierende Obstacles schneidet
-  blockingWarnings.length = 0;
-  if (route?.features?.length) {
-    try {
-      const line = route.features[0];
-      // @ts-ignore
-      const routeBuffer = buffer(line, ROUTE_BUFFER_KM, { units: "kilometers" });
+  if (route.features.length) {
+    const line = route.features[0];
+    const routeBuffer = buffer(line as any, ROUTE_BUFFER_KM, { units: "kilometers" });
 
-      for (const obs of obstacles) {
-        if (!booleanIntersects(routeBuffer, obs)) continue;
-
-        const limits = getLimits(obs.properties);
-        const blocked = (limits.width < vWidth) || (limits.weight < vWeight);
-
-        if (blocked) {
-          const p = obs.properties || {};
-          blockingWarnings.push({
-            title: p.title || p.description || "Obstacle",
-            description: p.description,
-            limits,
-            coords: centroid(obs).geometry.coordinates,
-            already_avoided: avoidIds.has(stableObsId(obs)),
-          });
-        }
+    for (const obs of obstacles) {
+      if (!booleanIntersects(routeBuffer, obs)) continue;
+      const limits = getLimits(obs.properties);
+      if (limits.width < vWidth || limits.weight < vWeight) {
+        blockingWarnings.push({
+          title: obs.properties?.title,
+          description: obs.properties?.description,
+          limits,
+          coords: centroid(obs).geometry.coordinates,
+          already_avoided: avoidIds.has(stableObsId(obs)),
+        });
       }
-    } catch {
-      // wenn der Check fehlschlägt: niemals clean behaupten
-      routeIsClean = false;
-      if (!finalError) finalError = "Final route validation failed";
     }
   }
 
-  if (blockingWarnings.length > 0) {
+  if (blockingWarnings.length) {
     routeIsClean = false;
-    if (!finalError) finalError = "Route blocked by one or more obstacles";
+    if (!finalError) finalError = "Route blocked by obstacles";
   }
-
-  const status =
-    routeIsClean ? "CLEAN" :
-    finalError?.includes("Avoid polygon limit hit") ? "LIMIT_HIT" :
-    route?.features?.length ? "BLOCKED" : "FAILED";
 
   return NextResponse.json({
     meta: {
@@ -305,7 +236,7 @@ export async function POST(req: NextRequest) {
       iterations,
       avoids_applied: avoids.length,
       clean: routeIsClean,
-      status,
+      status: routeIsClean ? "CLEAN" : "BLOCKED",
       error: finalError,
     },
     avoid_applied: { total: avoids.length },
