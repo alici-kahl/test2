@@ -56,54 +56,75 @@ function stableObsId(obs: Feature<any>): string {
 }
 
 /**
- * Sehr konservativ: statt komplexer Polygon-Geometrie nehmen wir eine kleine BBox um die Baustelle,
- * gepuffert um 20m. Das ist robust und reicht für "avoid"-Routing.
+ * Robust & schnell: kleine BBox um die Baustelle (gebuffert).
  */
 function createAvoidPolygon(f: Feature<any>): Feature<Polygon> | null {
   try {
     const bf = buffer(f, 0.02, { units: "kilometers" }); // 20m
     const b = bboxFn(bf);
-    return polygon([[
-      [b[0], b[1]],
-      [b[2], b[1]],
-      [b[2], b[3]],
-      [b[0], b[3]],
-      [b[0], b[1]],
-    ]]);
+    return polygon([
+      [
+        [b[0], b[1]],
+        [b[2], b[1]],
+        [b[2], b[3]],
+        [b[0], b[3]],
+        [b[0], b[1]],
+      ],
+    ]);
   } catch {
     return null;
   }
 }
 
-async function callValhalla(reqBody: any, avoidPolys: Feature<Polygon>[]) {
+async function callValhalla(origin: string, reqBody: any, avoidPolys: Feature<Polygon>[]) {
   const payload = {
     ...reqBody,
     avoid_polygons: avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined,
     exclude_polygons: avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined,
   };
 
-  const host = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "http://localhost:3000";
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20_000);
 
-  const res = await fetch(`${host}/api/route/valhalla`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+  try {
+    const res = await fetch(`${origin}/api/route/valhalla`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
 
-  if (!res.ok) {
-    return { geojson: { type: "FeatureCollection", features: [] }, error: await res.text() };
+    clearTimeout(timeout);
+
+    // Wichtig: IMMER JSON-artig zurückgeben (damit Plan-Route nie "komisch" wird)
+    const text = await res.text().catch(() => "");
+    try {
+      const parsed = JSON.parse(text);
+      return parsed;
+    } catch {
+      return { geojson: { type: "FeatureCollection", features: [] }, error: text || "Valhalla Antwort nicht lesbar" };
+    }
+  } catch (e: any) {
+    clearTimeout(timeout);
+    return { geojson: { type: "FeatureCollection", features: [] }, error: String(e) };
   }
-  return await res.json();
 }
 
 async function postJSON<T>(origin: string, path: string, body: any): Promise<T | null> {
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15_000);
+
     const r = await fetch(`${origin}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: controller.signal,
     });
+
+    clearTimeout(timeout);
     if (!r.ok) return null;
+
     return (await r.json()) as T;
   } catch {
     return null;
@@ -152,12 +173,16 @@ export async function POST(req: NextRequest) {
   const vWidth = body.vehicle?.width_m ?? 2.55;
   const vWeight = body.vehicle?.weight_t ?? 40;
 
-  // Ziel: "so lange wie möglich versuchen" – aber innerhalb maxDuration.
-  // Deshalb: mehrere BBox-Stufen (größerer Suchraum = mehr Roadworks-Infos = bessere Umfahrungsversuche).
-  const BBOX_STEPS_KM = [150, 300, 600]; // kannst du später erhöhen, aber 600km ist schon groß
-  const MAX_ITERATIONS_PER_STEP = 10;    // pro Stufe
-  const ROUTE_BUFFER_KM = 0.02;          // 20m
-  const valhallaSoftMax = body.valhalla_soft_max ?? 400; // mehr Luft als 200
+  // Wichtig gegen 504: harter Zeitdeckel für das gesamte Plan-Routing
+  const TIME_BUDGET_MS = 50_000; // < 60s
+  const t0 = Date.now();
+  const timeLeft = () => TIME_BUDGET_MS - (Date.now() - t0);
+
+  // Minimal, aber wirksam: weniger Schleifen, dafür IMMER automatische Notlösung am Ende
+  const BBOX_STEPS_KM = [150, 300];
+  const MAX_ITERATIONS_PER_STEP = 5;
+  const ROUTE_BUFFER_KM = 0.02;
+  const valhallaSoftMax = body.valhalla_soft_max ?? 200;
 
   const origin = req.nextUrl.origin;
 
@@ -172,7 +197,6 @@ export async function POST(req: NextRequest) {
 
   const phases: any[] = [];
 
-  // Ergebnisvariablen
   let finalRoute: FeatureCollection = { type: "FeatureCollection", features: [] };
   let finalWarnings: any[] = [];
   let finalStatus: "CLEAN" | "WARN" | "BLOCKED" = "BLOCKED";
@@ -180,22 +204,20 @@ export async function POST(req: NextRequest) {
   let totalIterations = 0;
   let finalAvoidCount = 0;
   let usedBboxKm: number | null = null;
-  let fallbackUsed = false;
 
-  // ---- Phase 1: "STRICT" – Umfahrungen versuchen, Roadworks-BBox wächst
+  // ---- Phase 1: STRICT (versuchen, passende Route zu finden)
   for (const bboxKm of BBOX_STEPS_KM) {
     usedBboxKm = bboxKm;
+    if (timeLeft() < 12_000) break; // nicht mehr genug Luft für sinnvolle Schleifen
 
     const bbox = makeSafeBBox(start, end, bboxKm);
 
-    // Roadworks holen (für diese Stufe)
     const obstacles: Feature<any>[] = [];
     const rw = await postJSON<{ features: Feature<any>[] }>(origin, "/api/roadworks", {
       ts,
       tz,
       bbox,
       buffer_m: body.roadworks?.buffer_m ?? 60,
-      // IMPORTANT: Umfahrungen brauchen oft Nicht-Autobahn
       only_motorways: body.roadworks?.only_motorways ?? false,
     });
     if (rw?.features?.length) obstacles.push(...rw.features);
@@ -207,10 +229,15 @@ export async function POST(req: NextRequest) {
     let stuckReason: string | null = null;
 
     while (iterations < MAX_ITERATIONS_PER_STEP) {
+      if (timeLeft() < 10_000) {
+        stuckReason = "Zeitbudget erreicht (vor Notlösung abgebrochen).";
+        break;
+      }
+
       iterations++;
       totalIterations++;
 
-      const res = await callValhalla(plannerReqBase, avoids);
+      const res = await callValhalla(origin, plannerReqBase, avoids);
 
       if (!res?.geojson?.features?.length) {
         stuckReason = res?.error ?? "Keine Route gefunden (Valhalla).";
@@ -229,8 +256,6 @@ export async function POST(req: NextRequest) {
       for (const obs of obstacles) {
         if (!booleanIntersects(routeBuffer, obs)) continue;
         const limits = getLimits(obs.properties);
-
-        // passt -> kein Problem
         if (limits.width >= vWidth && limits.weight >= vWeight) continue;
 
         blocked++;
@@ -246,14 +271,7 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      // CLEAN erreicht
       if (blocked === 0) {
-        finalRoute = route;
-        finalWarnings = [];
-        finalStatus = "CLEAN";
-        finalError = null;
-        finalAvoidCount = avoids.length;
-
         phases.push({
           phase: "STRICT",
           bbox_km: bboxKm,
@@ -264,36 +282,33 @@ export async function POST(req: NextRequest) {
 
         return NextResponse.json({
           meta: {
-            source: "route/plan-v17-two-phase",
-            status: finalStatus,
+            source: "route/plan-v18-budgeted-two-phase",
+            status: "CLEAN",
             clean: true,
-            error: finalError,
+            error: null,
             iterations: totalIterations,
-            avoids_applied: finalAvoidCount,
+            avoids_applied: avoids.length,
             bbox_km_used: usedBboxKm,
             fallback_used: false,
             phases,
           },
-          avoid_applied: { total: finalAvoidCount },
-          geojson: finalRoute,
-          blocking_warnings: finalWarnings,
+          avoid_applied: { total: avoids.length },
+          geojson: route,
+          blocking_warnings: [],
         });
       }
 
-      // wir konnten nichts Neues vermeiden -> "stuck"
       if (added === 0) {
         stuckReason = "Keine weitere Umfahrung möglich (keine neuen Avoids ableitbar).";
         break;
       }
 
-      // Avoid-Limit
       if (avoids.length >= valhallaSoftMax) {
         stuckReason = "Avoid-Limit erreicht (zu viele Baustellen/Restriktionen im Suchraum).";
         break;
       }
     }
 
-    // STRICT nicht CLEAN: protokollieren und zur nächsten BBox-Stufe
     const strictWarnings = collectBlockingWarnings(route, obstacles, ROUTE_BUFFER_KM, vWidth, vWeight, avoidIds);
 
     phases.push({
@@ -306,19 +321,17 @@ export async function POST(req: NextRequest) {
       blocking_warnings: strictWarnings.length,
     });
 
-    // wir merken uns die "beste bisherige" Route (falls wir am Ende gar nichts finden)
-    // aber wichtig: wir werden sowieso Fallback fahren, wenn nicht CLEAN.
+    // best effort merken (falls fallback aus irgendeinem Grund gar nicht geht)
     if (route.features.length) {
       finalRoute = route;
       finalWarnings = strictWarnings;
       finalAvoidCount = avoids.length;
-      finalStatus = strictWarnings.length ? "WARN" : "CLEAN";
+      finalStatus = "WARN";
       finalError = stuckReason;
     }
   }
 
-  // ---- Phase 2: Fallback (automatisch!) – OHNE Avoids routen, dann warnen
-  fallbackUsed = true;
+  // ---- Phase 2: AUTOMATISCHE Notlösung – ohne Avoids routen, dann warnen
   const bboxForFallback = makeSafeBBox(start, end, BBOX_STEPS_KM[BBOX_STEPS_KM.length - 1]);
 
   const obstaclesFallback: Feature<any>[] = [];
@@ -331,83 +344,69 @@ export async function POST(req: NextRequest) {
   });
   if (rwFallback?.features?.length) obstaclesFallback.push(...rwFallback.features);
 
-  const fallbackRes = await callValhalla(plannerReqBase, []); // <<< ohne Avoids
+  const fallbackRes = await callValhalla(origin, plannerReqBase, []); // ohne Avoids
   const fallbackRoute: FeatureCollection = fallbackRes?.geojson ?? { type: "FeatureCollection", features: [] };
 
   if (!fallbackRoute?.features?.length) {
-    // wirklich gar keine Route (Start/Ziel unplausibel, Valhalla down, etc.)
-    finalStatus = "BLOCKED";
-    finalRoute = { type: "FeatureCollection", features: [] };
-    finalWarnings = [];
-    finalError =
-      typeof fallbackRes?.error === "string" && fallbackRes.error.length
-        ? fallbackRes.error
-        : "Es konnte gar keine Route berechnet werden (auch nicht als Notlösung).";
-
-    phases.push({
-      phase: "FALLBACK_NO_AVOIDS",
-      bbox_km: BBOX_STEPS_KM[BBOX_STEPS_KM.length - 1],
-      result: "NO_ROUTE",
-      reason: finalError,
-    });
-
+    // wirklich gar keine Route berechenbar
     return NextResponse.json({
       meta: {
-        source: "route/plan-v17-two-phase",
-        status: finalStatus,
+        source: "route/plan-v18-budgeted-two-phase",
+        status: "BLOCKED",
         clean: false,
-        error: finalError,
+        error:
+          typeof fallbackRes?.error === "string" && fallbackRes.error.length
+            ? fallbackRes.error
+            : "Es konnte gar keine Route berechnet werden (auch nicht als Notlösung).",
         iterations: totalIterations,
         avoids_applied: finalAvoidCount,
         bbox_km_used: usedBboxKm,
         fallback_used: true,
-        phases,
+        phases: [
+          ...phases,
+          {
+            phase: "FALLBACK_NO_AVOIDS",
+            bbox_km: BBOX_STEPS_KM[BBOX_STEPS_KM.length - 1],
+            result: "NO_ROUTE",
+          },
+        ],
       },
       avoid_applied: { total: finalAvoidCount },
-      geojson: finalRoute,
-      blocking_warnings: finalWarnings,
+      geojson: { type: "FeatureCollection", features: [] },
+      blocking_warnings: [],
     });
   }
 
-  const fallbackWarnings = collectBlockingWarnings(
-    fallbackRoute,
-    obstaclesFallback,
-    ROUTE_BUFFER_KM,
-    vWidth,
-    vWeight
-  );
+  const fallbackWarnings = collectBlockingWarnings(fallbackRoute, obstaclesFallback, ROUTE_BUFFER_KM, vWidth, vWeight);
 
-  finalStatus = fallbackWarnings.length ? "WARN" : "CLEAN";
-  finalRoute = fallbackRoute;
-  finalWarnings = fallbackWarnings;
-
-  // Deutsche, klare Meldung:
-  finalError =
-    finalStatus === "WARN"
+  const status: "CLEAN" | "WARN" = fallbackWarnings.length ? "WARN" : "CLEAN";
+  const errorMsg =
+    status === "WARN"
       ? "Es wurde keine vollständig passende Umfahrung gefunden. Notlösung angezeigt; bitte Warnungen prüfen."
       : null;
 
-  phases.push({
-    phase: "FALLBACK_NO_AVOIDS",
-    bbox_km: BBOX_STEPS_KM[BBOX_STEPS_KM.length - 1],
-    result: finalStatus,
-    blocking_warnings: fallbackWarnings.length,
-  });
-
   return NextResponse.json({
     meta: {
-      source: "route/plan-v17-two-phase",
-      status: finalStatus,
-      clean: finalStatus === "CLEAN",
-      error: finalError,
+      source: "route/plan-v18-budgeted-two-phase",
+      status,
+      clean: status === "CLEAN",
+      error: errorMsg,
       iterations: totalIterations,
       avoids_applied: finalAvoidCount,
       bbox_km_used: usedBboxKm,
       fallback_used: true,
-      phases,
+      phases: [
+        ...phases,
+        {
+          phase: "FALLBACK_NO_AVOIDS",
+          bbox_km: BBOX_STEPS_KM[BBOX_STEPS_KM.length - 1],
+          result: status,
+          blocking_warnings: fallbackWarnings.length,
+        },
+      ],
     },
     avoid_applied: { total: finalAvoidCount },
-    geojson: finalRoute,
-    blocking_warnings: finalWarnings,
+    geojson: fallbackRoute,
+    blocking_warnings: fallbackWarnings,
   });
 }
