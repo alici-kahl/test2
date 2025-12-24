@@ -372,6 +372,14 @@ export default function Page() {
   const [startCoord, setStartCoord] = useState<Coords | null>(null);
   const [endCoord, setEndCoord] = useState<Coords | null>(null);
 
+  // --- SAFE setData helper (verhindert setData-crash wenn Source noch nicht da ist) ---
+  const safeSetGeoJSONSource = (map: Map, sourceId: string, data: any) => {
+    const src = map.getSource(sourceId) as maplibregl.GeoJSONSource | undefined;
+    if (!src || typeof (src as any).setData !== "function") return false;
+    src.setData(data);
+    return true;
+  };
+
   // -------------------- Map init --------------------
   useEffect(() => {
     if (mapRef.current || !containerRef.current) return;
@@ -684,69 +692,68 @@ export default function Page() {
     const map = mapRef.current;
     if (!map) return;
 
-    // >>> NEU: wenn keine Route vorhanden, Linienquellen leeren
+    // WICHTIG: erst zeichnen/leeren, wenn Style/Sources sicher geladen sind
+    if (!mapLoadedRef.current) return;
+
+    const emptyFC = { type: "FeatureCollection", features: [] as any[] };
+
+    // >>> NEU: wenn keine Route vorhanden, Linienquellen leeren (sicher)
     if (!geojson) {
-      (map.getSource("route-active") as maplibregl.GeoJSONSource).setData({
-        type: "FeatureCollection",
-        features: [],
-      });
-      (map.getSource("route-alts") as maplibregl.GeoJSONSource).setData({
-        type: "FeatureCollection",
-        features: [],
-      });
+      safeSetGeoJSONSource(map, "route-active", emptyFC);
+      safeSetGeoJSONSource(map, "route-alts", emptyFC);
+      safeSetGeoJSONSource(map, "points", emptyFC);
+
       setSteps([]);
       setStreets([]);
       return;
     }
 
     const features: any[] = geojson.features ?? [];
-    {
-      const active = features[activeIdx] ?? features[0];
-      const alts = features
-        .map((f: any, i: number) => ({ ...f, properties: { ...(f.properties || {}), idx: i } }))
-        .filter((_: any, i: number) => i !== activeIdx);
+    const active = features[activeIdx] ?? features[0];
+    const alts = features
+      .map((f: any, i: number) => ({ ...f, properties: { ...(f.properties || {}), idx: i } }))
+      .filter((_: any, i: number) => i !== activeIdx);
 
-      (map.getSource("route-active") as maplibregl.GeoJSONSource).setData({
-        type: "FeatureCollection",
-        features: active ? [active] : [],
+    safeSetGeoJSONSource(map, "route-active", {
+      type: "FeatureCollection",
+      features: active ? [active] : [],
+    });
+    safeSetGeoJSONSource(map, "route-alts", {
+      type: "FeatureCollection",
+      features: alts,
+    });
+
+    const maneuvers = active?.properties?.maneuvers ?? [];
+    setSteps(maneuvers);
+    setStreets(active?.properties?.streets_sequence ?? []);
+
+    const pts: any[] = [];
+    if (startCoord)
+      pts.push({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: startCoord },
+        properties: { role: "start" },
       });
-      (map.getSource("route-alts") as maplibregl.GeoJSONSource).setData({
-        type: "FeatureCollection",
-        features: alts,
+    if (endCoord)
+      pts.push({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: endCoord },
+        properties: { role: "end" },
       });
+    safeSetGeoJSONSource(map, "points", {
+      type: "FeatureCollection",
+      features: pts,
+    });
 
-      const maneuvers = active?.properties?.maneuvers ?? [];
-      setSteps(maneuvers);
-      setStreets(active?.properties?.streets_sequence ?? []);
-
-      const pts: any[] = [];
-      if (startCoord)
-        pts.push({
-          type: "Feature",
-          geometry: { type: "Point", coordinates: startCoord },
-          properties: { role: "start" },
-        });
-      if (endCoord)
-        pts.push({
-          type: "Feature",
-          geometry: { type: "Point", coordinates: endCoord },
-          properties: { role: "end" },
-        });
-      (map.getSource("points") as maplibregl.GeoJSONSource).setData({
-        type: "FeatureCollection",
-        features: pts,
-      });
-
-      const bbox: [number, number, number, number] | undefined = active?.properties?.bbox;
-      if (bbox) {
-        map.fitBounds(
-          [
-            [bbox[0], bbox[1]],
-            [bbox[2], bbox[3]],
-          ],
-          { padding: { top: 40, right: 40, bottom: 40, left: 360 } }
-        );
-      }
+    const bbox: [number, number, number, number] | undefined = active?.properties?.bbox;
+    if (bbox) {
+      map.fitBounds(
+        [
+          [bbox[0], bbox[1]],
+          [bbox[2], bbox[3]],
+        ],
+        { padding: { top: 40, right: 40, bottom: 40, left: 360 } }
+      );
     }
   }, [geojson, activeIdx, startCoord, endCoord]);
 
