@@ -345,6 +345,13 @@ export default function Page() {
   const [rwLoading, setRwLoading] = useState(false);
   const [rwCount, setRwCount] = useState(0);
 
+  // >>> NEU: Blockade-Info aus /api/route/plan
+  const [planBlocked, setPlanBlocked] = useState<null | {
+    error?: string | null;
+    warnings?: any[];
+    meta?: any;
+  }>(null);
+
   const [whenIsoLocal, setWhenIsoLocal] = useState<string>(() => {
     const d = new Date();
     d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
@@ -675,7 +682,22 @@ export default function Page() {
   // -------------------- Route zeichnen --------------------
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !geojson) return;
+    if (!map) return;
+
+    // >>> NEU: wenn keine Route vorhanden, Linienquellen leeren
+    if (!geojson) {
+      (map.getSource("route-active") as maplibregl.GeoJSONSource).setData({
+        type: "FeatureCollection",
+        features: [],
+      });
+      (map.getSource("route-alts") as maplibregl.GeoJSONSource).setData({
+        type: "FeatureCollection",
+        features: [],
+      });
+      setSteps([]);
+      setStreets([]);
+      return;
+    }
 
     const features: any[] = geojson.features ?? [];
     {
@@ -842,6 +864,9 @@ export default function Page() {
 
       let data: any = null;
 
+      // >>> NEU: vor jedem Plan resetten
+      setPlanBlocked(null);
+
       if (usePlanner) {
         // ---- Neuer Planer (/api/route/plan) ----
         const body = buildPlanBody(
@@ -885,7 +910,22 @@ export default function Page() {
           limit_hit: m.limit_hit,
         });
 
-        setGeojson(data.geojson);
+        // >>> OPTION A (WICHTIG):
+        // Wenn BLOCKED: KEINE Route zeichnen, sondern Blockade anzeigen.
+        if (data?.meta?.status === "BLOCKED") {
+          setGeojson(null); // sorgt dafür, dass die Linie verschwindet
+          setActiveIdx(0);
+          setSteps([]);
+          setStreets([]);
+          setPlanBlocked({
+            error: data?.meta?.error ?? "Route ist blockiert.",
+            warnings: Array.isArray(data?.blocking_warnings) ? data.blocking_warnings : [],
+            meta: data?.meta ?? null,
+          });
+        } else {
+          setGeojson(data.geojson);
+          setPlanBlocked(null);
+        }
       } else {
         // ---- Klassisch direkt Valhalla (/api/route/valhalla) ----
         const res = await fetch("/api/route/valhalla", {
@@ -908,6 +948,7 @@ export default function Page() {
         }
         setPlanMeta(null);
         setGeojson(data.geojson);
+        setPlanBlocked(null);
       }
 
       setActiveIdx(0);
@@ -972,6 +1013,48 @@ export default function Page() {
         <p style={{ margin: "8px 0 12px 0" }}>
           Adresse <b>oder</b> „lon, lat“ eingeben. Alternativrouten sind anklickbar. Aktive Baustellen können als Layer eingeblendet werden.
         </p>
+
+        {/* >>> NEU: BLOCKED-Box (Option A) */}
+        {planBlocked && (
+          <div
+            style={{
+              padding: 10,
+              border: "1px solid #f2c3c3",
+              background: "#fff5f5",
+              borderRadius: 10,
+              marginBottom: 12,
+            }}
+          >
+            <div style={{ fontWeight: 700, marginBottom: 6 }}>Route nicht möglich (BLOCKED)</div>
+            <div style={{ fontSize: 13, color: "#7a1f1f", marginBottom: 8 }}>
+              {planBlocked.error || "Die Route ist für dieses Fahrzeug nicht fahrbar."}
+            </div>
+
+            {Array.isArray(planBlocked.warnings) && planBlocked.warnings.length > 0 && (
+              <div style={{ fontSize: 13, color: "#333" }}>
+                <div style={{ fontWeight: 600, marginBottom: 4 }}>Blockierende Stelle(n):</div>
+                <ul style={{ margin: 0, paddingLeft: 18 }}>
+                  {planBlocked.warnings.slice(0, 5).map((w: any, idx: number) => (
+                    <li key={idx} style={{ marginBottom: 6 }}>
+                      <div style={{ fontWeight: 600 }}>{w.title || "Baustelle/Restriktion"}</div>
+                      {w.limits && (
+                        <div style={{ fontSize: 12, color: "#555" }}>
+                          Max. Breite: {typeof w.limits.width === "number" ? `${w.limits.width.toFixed(2)} m` : "–"} •
+                          Max. Gewicht: {typeof w.limits.weight === "number" ? `${w.limits.weight} t` : "–"}
+                        </div>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+                {planBlocked.warnings.length > 5 && (
+                  <div style={{ fontSize: 12, color: "#666", marginTop: 6 }}>
+                    …und {planBlocked.warnings.length - 5} weitere.
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="box" style={{ padding: 8, border: "1px solid #eee", borderRadius: 8, marginBottom: 12 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
