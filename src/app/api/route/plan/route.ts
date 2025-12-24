@@ -55,6 +55,10 @@ function stableObsId(obs: Feature<any>): string {
   return String(p.roadwork_id ?? p.external_id ?? p.restriction_id ?? p.id ?? JSON.stringify(bboxFn(obs)));
 }
 
+/**
+ * Sehr konservativ: statt komplexer Polygon-Geometrie nehmen wir eine kleine BBox um die Baustelle,
+ * gepuffert um 20m. Das ist robust und reicht für "avoid"-Routing.
+ */
 function createAvoidPolygon(f: Feature<any>): Feature<Polygon> | null {
   try {
     const bf = buffer(f, 0.02, { units: "kilometers" }); // 20m
@@ -74,9 +78,7 @@ function createAvoidPolygon(f: Feature<any>): Feature<Polygon> | null {
 async function callValhalla(reqBody: any, avoidPolys: Feature<Polygon>[]) {
   const payload = {
     ...reqBody,
-    // wichtig: Valhalla erwartet Geometrien
     avoid_polygons: avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined,
-    // optionaler Kompat-Key (schadet nicht, hilft je nach Setup)
     exclude_polygons: avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined,
   };
 
@@ -91,7 +93,6 @@ async function callValhalla(reqBody: any, avoidPolys: Feature<Polygon>[]) {
   if (!res.ok) {
     return { geojson: { type: "FeatureCollection", features: [] }, error: await res.text() };
   }
-
   return await res.json();
 }
 
@@ -109,6 +110,36 @@ async function postJSON<T>(origin: string, path: string, body: any): Promise<T |
   }
 }
 
+function collectBlockingWarnings(
+  route: FeatureCollection,
+  obstacles: Feature<any>[],
+  routeBufferKm: number,
+  vWidth: number,
+  vWeight: number,
+  avoidIds?: Set<string>
+) {
+  const warnings: any[] = [];
+  if (!route?.features?.length) return warnings;
+
+  const line = route.features[0];
+  const routeBuffer = buffer(line as any, routeBufferKm, { units: "kilometers" });
+
+  for (const obs of obstacles) {
+    if (!booleanIntersects(routeBuffer, obs)) continue;
+    const limits = getLimits(obs.properties);
+    if (limits.width < vWidth || limits.weight < vWeight) {
+      warnings.push({
+        title: obs.properties?.title,
+        description: obs.properties?.description,
+        limits,
+        coords: centroid(obs).geometry.coordinates,
+        already_avoided: avoidIds ? avoidIds.has(stableObsId(obs)) : false,
+      });
+    }
+  }
+  return warnings;
+}
+
 export async function POST(req: NextRequest) {
   const body = (await req.json().catch(() => ({}))) as PlanReq;
 
@@ -121,146 +152,262 @@ export async function POST(req: NextRequest) {
   const vWidth = body.vehicle?.width_m ?? 2.55;
   const vWeight = body.vehicle?.weight_t ?? 40;
 
-  // Mehr Freiheit (Option A):
-  const MAX_ITERATIONS = 10;
-  const ROUTE_BUFFER_KM = 0.02;
-  const valhallaSoftMax = body.valhalla_soft_max ?? 200;
+  // Ziel: "so lange wie möglich versuchen" – aber innerhalb maxDuration.
+  // Deshalb: mehrere BBox-Stufen (größerer Suchraum = mehr Roadworks-Infos = bessere Umfahrungsversuche).
+  const BBOX_STEPS_KM = [150, 300, 600]; // kannst du später erhöhen, aber 600km ist schon groß
+  const MAX_ITERATIONS_PER_STEP = 10;    // pro Stufe
+  const ROUTE_BUFFER_KM = 0.02;          // 20m
+  const valhallaSoftMax = body.valhalla_soft_max ?? 400; // mehr Luft als 200
 
-  // Größerer Suchraum für Umfahrungen
-  const bbox = makeSafeBBox(start, end, 150);
   const origin = req.nextUrl.origin;
 
-  const obstacles: Feature<any>[] = [];
+  const plannerReqBase = {
+    start,
+    end,
+    vehicle: body.vehicle,
+    alternates: body.alternates ?? 2,
+    directions_language: body.directions_language ?? "de-DE",
+    respect_direction: body.respect_direction ?? true,
+  };
 
-  const rw = await postJSON<{ features: Feature<any>[] }>(origin, "/api/roadworks", {
-    ts,
-    tz,
-    bbox,
-    buffer_m: body.roadworks?.buffer_m ?? 60,
-    // default: nicht motorway-only (sonst gibt es oft keine Umfahrungen)
-    only_motorways: body.roadworks?.only_motorways ?? false,
-  });
+  const phases: any[] = [];
 
-  if (rw?.features?.length) obstacles.push(...rw.features);
-
-  let avoids: Feature<Polygon>[] = [];
-  let avoidIds = new Set<string>();
-  let iterations = 0;
-  let routeIsClean = false;
+  // Ergebnisvariablen
+  let finalRoute: FeatureCollection = { type: "FeatureCollection", features: [] };
+  let finalWarnings: any[] = [];
+  let finalStatus: "CLEAN" | "WARN" | "BLOCKED" = "BLOCKED";
   let finalError: string | null = null;
-  let route: FeatureCollection = { type: "FeatureCollection", features: [] };
-  const blockingWarnings: any[] = [];
+  let totalIterations = 0;
+  let finalAvoidCount = 0;
+  let usedBboxKm: number | null = null;
+  let fallbackUsed = false;
 
-  while (iterations < MAX_ITERATIONS) {
-    iterations++;
+  // ---- Phase 1: "STRICT" – Umfahrungen versuchen, Roadworks-BBox wächst
+  for (const bboxKm of BBOX_STEPS_KM) {
+    usedBboxKm = bboxKm;
 
-    const res = await callValhalla(
-      {
-        start,
-        end,
-        vehicle: body.vehicle,
-        alternates: body.alternates ?? 2,
-        directions_language: body.directions_language ?? "de-DE",
-        respect_direction: body.respect_direction ?? true,
-      },
-      avoids
-    );
+    const bbox = makeSafeBBox(start, end, bboxKm);
 
-    if (!res?.geojson?.features?.length) {
-      finalError = res?.error ?? "No route found";
-      route = { type: "FeatureCollection", features: [] };
-      break;
-    }
+    // Roadworks holen (für diese Stufe)
+    const obstacles: Feature<any>[] = [];
+    const rw = await postJSON<{ features: Feature<any>[] }>(origin, "/api/roadworks", {
+      ts,
+      tz,
+      bbox,
+      buffer_m: body.roadworks?.buffer_m ?? 60,
+      // IMPORTANT: Umfahrungen brauchen oft Nicht-Autobahn
+      only_motorways: body.roadworks?.only_motorways ?? false,
+    });
+    if (rw?.features?.length) obstacles.push(...rw.features);
 
-    route = res.geojson;
-    const line = route.features[0];
-    const routeBuffer = buffer(line as any, ROUTE_BUFFER_KM, { units: "kilometers" });
+    let avoids: Feature<Polygon>[] = [];
+    const avoidIds = new Set<string>();
+    let iterations = 0;
+    let route: FeatureCollection = { type: "FeatureCollection", features: [] };
+    let stuckReason: string | null = null;
 
-    let blocked = 0;
-    let added = 0;
+    while (iterations < MAX_ITERATIONS_PER_STEP) {
+      iterations++;
+      totalIterations++;
 
-    for (const obs of obstacles) {
-      if (!booleanIntersects(routeBuffer, obs)) continue;
-      const limits = getLimits(obs.properties);
-      if (limits.width >= vWidth && limits.weight >= vWeight) continue;
+      const res = await callValhalla(plannerReqBase, avoids);
 
-      blocked++;
-      const id = stableObsId(obs);
-      if (!avoidIds.has(id)) {
-        const poly = createAvoidPolygon(obs);
-        if (poly) {
-          avoids.push(poly);
-          avoidIds.add(id);
-          added++;
+      if (!res?.geojson?.features?.length) {
+        stuckReason = res?.error ?? "Keine Route gefunden (Valhalla).";
+        route = { type: "FeatureCollection", features: [] };
+        break;
+      }
+
+      route = res.geojson;
+
+      const line = route.features[0];
+      const routeBuffer = buffer(line as any, ROUTE_BUFFER_KM, { units: "kilometers" });
+
+      let blocked = 0;
+      let added = 0;
+
+      for (const obs of obstacles) {
+        if (!booleanIntersects(routeBuffer, obs)) continue;
+        const limits = getLimits(obs.properties);
+
+        // passt -> kein Problem
+        if (limits.width >= vWidth && limits.weight >= vWeight) continue;
+
+        blocked++;
+        const id = stableObsId(obs);
+
+        if (!avoidIds.has(id)) {
+          const poly = createAvoidPolygon(obs);
+          if (poly) {
+            avoids.push(poly);
+            avoidIds.add(id);
+            added++;
+          }
         }
       }
-    }
 
-    if (blocked === 0) {
-      routeIsClean = true;
-      break;
-    }
+      // CLEAN erreicht
+      if (blocked === 0) {
+        finalRoute = route;
+        finalWarnings = [];
+        finalStatus = "CLEAN";
+        finalError = null;
+        finalAvoidCount = avoids.length;
 
-    // Wenn wir keinen neuen Avoid mehr hinzufügen können, sind wir "stuck"
-    if (added === 0) {
-      finalError = "Route blocked - no valid detour possible";
-      break;
-    }
+        phases.push({
+          phase: "STRICT",
+          bbox_km: bboxKm,
+          iterations,
+          avoids_applied: avoids.length,
+          result: "CLEAN",
+        });
 
-    if (avoids.length >= valhallaSoftMax) {
-      finalError = "Avoid polygon limit hit";
-      break;
-    }
-  }
-
-  // Finaler Check: blockierende Stellen als Warnings sammeln (aber Route trotzdem zurückgeben)
-  if (route.features.length) {
-    const line = route.features[0];
-    const routeBuffer = buffer(line as any, ROUTE_BUFFER_KM, { units: "kilometers" });
-
-    for (const obs of obstacles) {
-      if (!booleanIntersects(routeBuffer, obs)) continue;
-      const limits = getLimits(obs.properties);
-      if (limits.width < vWidth || limits.weight < vWeight) {
-        blockingWarnings.push({
-          title: obs.properties?.title,
-          description: obs.properties?.description,
-          limits,
-          coords: centroid(obs).geometry.coordinates,
-          already_avoided: avoidIds.has(stableObsId(obs)),
+        return NextResponse.json({
+          meta: {
+            source: "route/plan-v17-two-phase",
+            status: finalStatus,
+            clean: true,
+            error: finalError,
+            iterations: totalIterations,
+            avoids_applied: finalAvoidCount,
+            bbox_km_used: usedBboxKm,
+            fallback_used: false,
+            phases,
+          },
+          avoid_applied: { total: finalAvoidCount },
+          geojson: finalRoute,
+          blocking_warnings: finalWarnings,
         });
       }
+
+      // wir konnten nichts Neues vermeiden -> "stuck"
+      if (added === 0) {
+        stuckReason = "Keine weitere Umfahrung möglich (keine neuen Avoids ableitbar).";
+        break;
+      }
+
+      // Avoid-Limit
+      if (avoids.length >= valhallaSoftMax) {
+        stuckReason = "Avoid-Limit erreicht (zu viele Baustellen/Restriktionen im Suchraum).";
+        break;
+      }
+    }
+
+    // STRICT nicht CLEAN: protokollieren und zur nächsten BBox-Stufe
+    const strictWarnings = collectBlockingWarnings(route, obstacles, ROUTE_BUFFER_KM, vWidth, vWeight, avoidIds);
+
+    phases.push({
+      phase: "STRICT",
+      bbox_km: bboxKm,
+      iterations,
+      avoids_applied: avoids.length,
+      result: route.features.length ? "WARN" : "NO_ROUTE",
+      reason: stuckReason,
+      blocking_warnings: strictWarnings.length,
+    });
+
+    // wir merken uns die "beste bisherige" Route (falls wir am Ende gar nichts finden)
+    // aber wichtig: wir werden sowieso Fallback fahren, wenn nicht CLEAN.
+    if (route.features.length) {
+      finalRoute = route;
+      finalWarnings = strictWarnings;
+      finalAvoidCount = avoids.length;
+      finalStatus = strictWarnings.length ? "WARN" : "CLEAN";
+      finalError = stuckReason;
     }
   }
 
-  // Status-Logik (Option A):
-  // - CLEAN: Route existiert & keine blockierenden Warnungen
-  // - WARN: Route existiert, aber es gibt blockierende Stellen (best effort)
-  // - BLOCKED: keine Route gefunden
-  let status: "CLEAN" | "WARN" | "BLOCKED" = "BLOCKED";
-  if (route.features.length) status = blockingWarnings.length ? "WARN" : "CLEAN";
-  routeIsClean = status === "CLEAN";
+  // ---- Phase 2: Fallback (automatisch!) – OHNE Avoids routen, dann warnen
+  fallbackUsed = true;
+  const bboxForFallback = makeSafeBBox(start, end, BBOX_STEPS_KM[BBOX_STEPS_KM.length - 1]);
 
-  if (status !== "CLEAN" && !finalError) {
-    finalError = status === "WARN" ? "Route hat blockierende Stellen (Best-Effort)" : "No route found";
+  const obstaclesFallback: Feature<any>[] = [];
+  const rwFallback = await postJSON<{ features: Feature<any>[] }>(origin, "/api/roadworks", {
+    ts,
+    tz,
+    bbox: bboxForFallback,
+    buffer_m: body.roadworks?.buffer_m ?? 60,
+    only_motorways: body.roadworks?.only_motorways ?? false,
+  });
+  if (rwFallback?.features?.length) obstaclesFallback.push(...rwFallback.features);
+
+  const fallbackRes = await callValhalla(plannerReqBase, []); // <<< ohne Avoids
+  const fallbackRoute: FeatureCollection = fallbackRes?.geojson ?? { type: "FeatureCollection", features: [] };
+
+  if (!fallbackRoute?.features?.length) {
+    // wirklich gar keine Route (Start/Ziel unplausibel, Valhalla down, etc.)
+    finalStatus = "BLOCKED";
+    finalRoute = { type: "FeatureCollection", features: [] };
+    finalWarnings = [];
+    finalError =
+      typeof fallbackRes?.error === "string" && fallbackRes.error.length
+        ? fallbackRes.error
+        : "Es konnte gar keine Route berechnet werden (auch nicht als Notlösung).";
+
+    phases.push({
+      phase: "FALLBACK_NO_AVOIDS",
+      bbox_km: BBOX_STEPS_KM[BBOX_STEPS_KM.length - 1],
+      result: "NO_ROUTE",
+      reason: finalError,
+    });
+
+    return NextResponse.json({
+      meta: {
+        source: "route/plan-v17-two-phase",
+        status: finalStatus,
+        clean: false,
+        error: finalError,
+        iterations: totalIterations,
+        avoids_applied: finalAvoidCount,
+        bbox_km_used: usedBboxKm,
+        fallback_used: true,
+        phases,
+      },
+      avoid_applied: { total: finalAvoidCount },
+      geojson: finalRoute,
+      blocking_warnings: finalWarnings,
+    });
   }
+
+  const fallbackWarnings = collectBlockingWarnings(
+    fallbackRoute,
+    obstaclesFallback,
+    ROUTE_BUFFER_KM,
+    vWidth,
+    vWeight
+  );
+
+  finalStatus = fallbackWarnings.length ? "WARN" : "CLEAN";
+  finalRoute = fallbackRoute;
+  finalWarnings = fallbackWarnings;
+
+  // Deutsche, klare Meldung:
+  finalError =
+    finalStatus === "WARN"
+      ? "Es wurde keine vollständig passende Umfahrung gefunden. Notlösung angezeigt; bitte Warnungen prüfen."
+      : null;
+
+  phases.push({
+    phase: "FALLBACK_NO_AVOIDS",
+    bbox_km: BBOX_STEPS_KM[BBOX_STEPS_KM.length - 1],
+    result: finalStatus,
+    blocking_warnings: fallbackWarnings.length,
+  });
 
   return NextResponse.json({
     meta: {
-      source: "route/plan-v16-bbox-only",
-      iterations,
-      avoids_applied: avoids.length,
-      clean: routeIsClean,
-      status,
+      source: "route/plan-v17-two-phase",
+      status: finalStatus,
+      clean: finalStatus === "CLEAN",
       error: finalError,
-      roadworks: {
-        after_merge: avoids.length,
-        avoid_polygons: avoids.length,
-        limit_hit: avoids.length >= valhallaSoftMax,
-      },
+      iterations: totalIterations,
+      avoids_applied: finalAvoidCount,
+      bbox_km_used: usedBboxKm,
+      fallback_used: true,
+      phases,
     },
-    avoid_applied: { total: avoids.length },
-    geojson: route,
-    blocking_warnings: blockingWarnings,
+    avoid_applied: { total: finalAvoidCount },
+    geojson: finalRoute,
+    blocking_warnings: finalWarnings,
   });
 }
