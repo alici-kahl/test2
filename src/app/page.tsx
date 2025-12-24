@@ -1,3 +1,4 @@
+/* src/app/page.tsx */
 "use client";
 
 import { useEffect, useRef, useState } from "react";
@@ -269,8 +270,7 @@ function AutocompleteInput(props: {
             marginTop: 4,
             maxHeight: 280,
             overflow: "auto",
-            boxShadow:
-              "0 8px 16px rgba(15,23,42,.08), 0 1px 2px rgba(15,23,42,.08)",
+            boxShadow: "0 8px 16px rgba(15,23,42,.08), 0 1px 2px rgba(15,23,42,.08)",
           }}
         >
           {loading && <div style={{ padding: 10, fontSize: 13, color: "#666" }}>Suche…</div>}
@@ -317,19 +317,11 @@ export default function Page() {
   const [usePlanner, setUsePlanner] = useState(true);
 
   // >>> Planner-Presets (starten mit DEFAULT_PLAN_PRESET)
-  const [corridorWidth, setCorridorWidth] = useState<number>(
-    DEFAULT_PLAN_PRESET.corridor.width_m
-  );
-  const [respectDir, setRespectDir] = useState<boolean>(
-    DEFAULT_PLAN_PRESET.respect_direction
-  );
+  const [corridorWidth, setCorridorWidth] = useState<number>(DEFAULT_PLAN_PRESET.corridor.width_m);
+  const [respectDir, setRespectDir] = useState<boolean>(DEFAULT_PLAN_PRESET.respect_direction);
   const [rwBuffer, setRwBuffer] = useState<number>(DEFAULT_PLAN_PRESET.roadworks.buffer_m);
-  const [avoidTargetMax, setAvoidTargetMax] = useState<number>(
-    DEFAULT_PLAN_PRESET.avoid_target_max
-  );
-  const [valhallaSoftMax, setValhallaSoftMax] = useState<number>(
-    DEFAULT_PLAN_PRESET.valhalla_soft_max
-  );
+  const [avoidTargetMax, setAvoidTargetMax] = useState<number>(DEFAULT_PLAN_PRESET.avoid_target_max);
+  const [valhallaSoftMax, setValhallaSoftMax] = useState<number>(DEFAULT_PLAN_PRESET.valhalla_soft_max);
   const [alternates, setAlternates] = useState<number>(DEFAULT_PLAN_PRESET.alternates);
 
   // Telemetrie vom Planer
@@ -345,7 +337,7 @@ export default function Page() {
   const [rwLoading, setRwLoading] = useState(false);
   const [rwCount, setRwCount] = useState(0);
 
-  // >>> NEU: Blockade-Info aus /api/route/plan
+  // >>> Blockade/Warn-Info aus /api/route/plan
   const [planBlocked, setPlanBlocked] = useState<null | {
     error?: string | null;
     warnings?: any[];
@@ -374,9 +366,10 @@ export default function Page() {
 
   // --- SAFE setData helper (verhindert setData-crash wenn Source noch nicht da ist) ---
   const safeSetGeoJSONSource = (map: Map, sourceId: string, data: any) => {
+    if (!mapLoadedRef.current || !map.isStyleLoaded()) return false;
     const src = map.getSource(sourceId) as maplibregl.GeoJSONSource | undefined;
     if (!src || typeof (src as any).setData !== "function") return false;
-    src.setData(data);
+    (src as any).setData(data);
     return true;
   };
 
@@ -398,24 +391,17 @@ export default function Page() {
               "https://c.tile.openstreetmap.org/{z}/{x}/{y}.png",
             ],
             tileSize: 256,
-            attribution:
-              '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+            attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
           },
           "route-active": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
           "route-alts": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
           points: { type: "geojson", data: { type: "FeatureCollection", features: [] } },
 
           // Linien-Quelle
-          "roadworks-lines": {
-            type: "geojson",
-            data: { type: "FeatureCollection", features: [] },
-          },
+          "roadworks-lines": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
 
           // Ungeclusterte Icon-Quelle (für Sicht ab Zoom >= 11)
-          "roadworks-icons": {
-            type: "geojson",
-            data: { type: "FeatureCollection", features: [] },
-          },
+          "roadworks-icons": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
 
           // Geclusterte Spiegelquelle derselben Punkte (für Zoom <= 10)
           "roadworks-icons-cluster": {
@@ -448,12 +434,7 @@ export default function Page() {
             id: "route-alts-line",
             type: "line",
             source: "route-alts",
-            paint: {
-              "line-color": "#666",
-              "line-width": 5,
-              "line-opacity": 0.9,
-              "line-dasharray": [2, 2],
-            },
+            paint: { "line-color": "#666", "line-width": 5, "line-opacity": 0.9, "line-dasharray": [2, 2] },
             layout: { "line-join": "round", "line-cap": "round" },
           },
           {
@@ -592,7 +573,7 @@ export default function Page() {
       if (typeof idx === "number") setActiveIdx(idx);
     });
 
-    // Popups für Straßenarbeiten (FIXED: nur eine Popup-Version, keine Duplikate)
+    // Popups für Straßenarbeiten
     const popup = new maplibregl.Popup({ closeButton: true, closeOnClick: false });
 
     const openRoadworkPopup = (f: maplibregl.MapboxGeoJSONFeature) => {
@@ -648,12 +629,10 @@ export default function Page() {
     };
 
     map.on("click", "roadworks-line", (e) => {
-      console.log("CLICK roadworks-line", e);
       const f = e.features?.[0];
       if (f) openRoadworkPopup(f);
     });
     map.on("click", "roadworks-icon", (e) => {
-      console.log("CLICK roadworks-icon", e);
       const f = e.features?.[0];
       if (f) openRoadworkPopup(f);
     });
@@ -691,18 +670,14 @@ export default function Page() {
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-
-    // WICHTIG: erst zeichnen/leeren, wenn Style/Sources sicher geladen sind
-    if (!mapLoadedRef.current) return;
+    if (!mapLoadedRef.current || !map.isStyleLoaded()) return;
 
     const emptyFC = { type: "FeatureCollection", features: [] as any[] };
 
-    // >>> NEU: wenn keine Route vorhanden, Linienquellen leeren (sicher)
     if (!geojson) {
       safeSetGeoJSONSource(map, "route-active", emptyFC);
       safeSetGeoJSONSource(map, "route-alts", emptyFC);
       safeSetGeoJSONSource(map, "points", emptyFC);
-
       setSteps([]);
       setStreets([]);
       return;
@@ -761,17 +736,11 @@ export default function Page() {
   async function refreshRoadworks() {
     if (!showRoadworks) return;
     const map = mapRef.current;
-    if (!map || !mapLoadedRef.current) return;
+    if (!map || !mapLoadedRef.current || !map.isStyleLoaded()) return;
 
     const b = map.getBounds();
-    const bbox: [number, number, number, number] = [
-      b.getWest(),
-      b.getSouth(),
-      b.getEast(),
-      b.getNorth(),
-    ];
+    const bbox: [number, number, number, number] = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
 
-    // lokale Zeit -> ISO UTC
     const local = new Date(whenIsoLocal);
     const ts = new Date(local.getTime() - local.getTimezoneOffset() * 60000).toISOString();
     const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "Europe/Berlin";
@@ -789,17 +758,13 @@ export default function Page() {
       const fc = data as { type: string; features: any[]; meta: any };
 
       const lineSrc = map.getSource("roadworks-lines") as maplibregl.GeoJSONSource | undefined;
-      if (lineSrc) lineSrc.setData(fc);
+      if (lineSrc) lineSrc.setData(fc as any);
 
       const pointFeats = (fc.features || [])
         .map((f: any) => {
           const p = f.properties || {};
           if (typeof p._icon_lon === "number" && typeof p._icon_lat === "number") {
-            return {
-              type: "Feature",
-              geometry: { type: "Point", coordinates: [p._icon_lon, p._icon_lat] },
-              properties: p,
-            };
+            return { type: "Feature", geometry: { type: "Point", coordinates: [p._icon_lon, p._icon_lat] }, properties: p };
           }
           const g = f.geometry;
           if (g?.type === "LineString" && Array.isArray(g.coordinates) && g.coordinates.length) {
@@ -811,21 +776,23 @@ export default function Page() {
         .filter(Boolean) as any[];
 
       const iconSrc = map.getSource("roadworks-icons") as maplibregl.GeoJSONSource | undefined;
-      if (iconSrc) iconSrc.setData({ type: "FeatureCollection", features: pointFeats });
+      if (iconSrc) iconSrc.setData({ type: "FeatureCollection", features: pointFeats } as any);
 
       const clusterSrc = map.getSource("roadworks-icons-cluster") as maplibregl.GeoJSONSource | undefined;
-      if (clusterSrc) clusterSrc.setData({ type: "FeatureCollection", features: pointFeats });
+      if (clusterSrc) clusterSrc.setData({ type: "FeatureCollection", features: pointFeats } as any);
 
       setRwCount(fc?.features?.length ?? 0);
     } catch (e) {
       console.error("roadworks fetch failed", e);
       setRwCount(0);
+
+      const empty = { type: "FeatureCollection", features: [] as any[] };
       const lineSrc = map.getSource("roadworks-lines") as maplibregl.GeoJSONSource | undefined;
-      if (lineSrc) lineSrc.setData({ type: "FeatureCollection", features: [] });
+      if (lineSrc) lineSrc.setData(empty as any);
       const iconSrc = map.getSource("roadworks-icons") as maplibregl.GeoJSONSource | undefined;
-      if (iconSrc) iconSrc.setData({ type: "FeatureCollection", features: [] });
+      if (iconSrc) iconSrc.setData(empty as any);
       const clusterSrc = map.getSource("roadworks-icons-cluster") as maplibregl.GeoJSONSource | undefined;
-      if (clusterSrc) clusterSrc.setData({ type: "FeatureCollection", features: [] });
+      if (clusterSrc) clusterSrc.setData(empty as any);
     } finally {
       setRwLoading(false);
     }
@@ -871,17 +838,17 @@ export default function Page() {
 
       let data: any = null;
 
-      // >>> NEU: vor jedem Plan resetten
+      // vor jedem Plan resetten
       setPlanBlocked(null);
 
       if (usePlanner) {
-        // ---- Neuer Planer (/api/route/plan) ----
         const body = buildPlanBody(
           start,
           end,
           {
             corridor: { mode: "soft", width_m: corridorWidth },
-            roadworks: { buffer_m: rwBuffer, only_motorways: true },
+            // OPTION A: motorway-only AUS, sonst kaum Umfahrungen
+            roadworks: { buffer_m: rwBuffer, only_motorways: false },
             avoid_target_max: avoidTargetMax,
             valhalla_soft_max: valhallaSoftMax,
             respect_direction: respectDir,
@@ -907,7 +874,6 @@ export default function Page() {
           return;
         }
 
-        // Telemetrie merken
         const m = data?.meta?.roadworks || {};
         setPlanMeta({
           after_merge: m.after_merge,
@@ -917,10 +883,10 @@ export default function Page() {
           limit_hit: m.limit_hit,
         });
 
-        // >>> OPTION A (WICHTIG):
-        // Wenn BLOCKED: KEINE Route zeichnen, sondern Blockade anzeigen.
+        // OPTION A: Route immer zeichnen, auch bei WARN (Best-Effort).
+        // Nur bei echtem BLOCKED (keine Route) leeren.
         if (data?.meta?.status === "BLOCKED") {
-          setGeojson(null); // sorgt dafür, dass die Linie verschwindet
+          setGeojson(null);
           setActiveIdx(0);
           setSteps([]);
           setStreets([]);
@@ -931,10 +897,18 @@ export default function Page() {
           });
         } else {
           setGeojson(data.geojson);
-          setPlanBlocked(null);
+
+          if (data?.meta?.status === "WARN") {
+            setPlanBlocked({
+              error: data?.meta?.error ?? "Route hat blockierende Stellen (Best-Effort).",
+              warnings: Array.isArray(data?.blocking_warnings) ? data.blocking_warnings : [],
+              meta: data?.meta ?? null,
+            });
+          } else {
+            setPlanBlocked(null);
+          }
         }
       } else {
-        // ---- Klassisch direkt Valhalla (/api/route/valhalla) ----
         const res = await fetch("/api/route/valhalla", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -942,7 +916,7 @@ export default function Page() {
             start,
             end,
             vehicle: { width_m: width, height_m: height, weight_t: weight, axleload_t: axle },
-            buffer_m: bufferValhalla, // nur relevant, falls Server-side Avoid vorhanden
+            buffer_m: bufferValhalla,
             directions_language: "de-DE",
             alternates,
           }),
@@ -981,15 +955,11 @@ export default function Page() {
     lines.push("");
     lines.push("Anweisungen:");
     (f.properties?.maneuvers ?? []).forEach((s: any, i: number) =>
-      lines.push(
-        `${i + 1}. ${s.instruction}  (${s.distance_km.toFixed(1)} km, ${sToMin(s.duration_s)} min)`
-      )
+      lines.push(`${i + 1}. ${s.instruction}  (${s.distance_km.toFixed(1)} km, ${sToMin(s.duration_s)} min)`)
     );
     lines.push("");
     lines.push("Befahrene Straßen (chronologisch, nicht dedupliziert):");
-    (f.properties?.streets_sequence ?? []).forEach((name: string, i: number) =>
-      lines.push(`${i + 1}. ${name}`)
-    );
+    (f.properties?.streets_sequence ?? []).forEach((name: string, i: number) => lines.push(`${i + 1}. ${name}`));
     const blob = new Blob([lines.join("\n")], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -1021,7 +991,7 @@ export default function Page() {
           Adresse <b>oder</b> „lon, lat“ eingeben. Alternativrouten sind anklickbar. Aktive Baustellen können als Layer eingeblendet werden.
         </p>
 
-        {/* >>> NEU: BLOCKED-Box (Option A) */}
+        {/* WARN/BLOCKED Box */}
         {planBlocked && (
           <div
             style={{
@@ -1032,14 +1002,16 @@ export default function Page() {
               marginBottom: 12,
             }}
           >
-            <div style={{ fontWeight: 700, marginBottom: 6 }}>Route nicht möglich (BLOCKED)</div>
+            <div style={{ fontWeight: 700, marginBottom: 6 }}>
+              {planBlocked?.meta?.status === "WARN" ? "Route gefunden (WARNUNG)" : "Route nicht möglich (BLOCKED)"}
+            </div>
             <div style={{ fontSize: 13, color: "#7a1f1f", marginBottom: 8 }}>
               {planBlocked.error || "Die Route ist für dieses Fahrzeug nicht fahrbar."}
             </div>
 
             {Array.isArray(planBlocked.warnings) && planBlocked.warnings.length > 0 && (
               <div style={{ fontSize: 13, color: "#333" }}>
-                <div style={{ fontWeight: 600, marginBottom: 4 }}>Blockierende Stelle(n):</div>
+                <div style={{ fontWeight: 600, marginBottom: 4 }}>Problemstelle(n):</div>
                 <ul style={{ margin: 0, paddingLeft: 18 }}>
                   {planBlocked.warnings.slice(0, 5).map((w: any, idx: number) => (
                     <li key={idx} style={{ marginBottom: 6 }}>
@@ -1073,7 +1045,9 @@ export default function Page() {
           <div style={{ marginTop: 6 }}>
             <label>Zeitpunkt (lokal)</label>
             <input className="inp" type="datetime-local" value={whenIsoLocal} onChange={(e) => setWhenIsoLocal(e.target.value)} />
-            <small style={{ color: "#666" }}>Gefiltert per RPC <code>get_active_roadworks_geojson</code></small>
+            <small style={{ color: "#666" }}>
+              Gefiltert per RPC <code>get_active_roadworks_geojson</code>
+            </small>
           </div>
           <div style={{ marginTop: 6 }}>
             <button onClick={refreshRoadworks}>Baustellen neu laden</button>
@@ -1186,7 +1160,7 @@ export default function Page() {
             <div className="legend" style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 12 }}>
               <span><span className="dot blue" /> Aktive Route</span>
               <span><span className="dot gray" /> Alternativen (anklickbar)</span>
-              <span><span className="dot" style={{ background:"#E67E22" }} /> Baustellen</span>
+              <span><span className="dot" style={{ background: "#E67E22" }} /> Baustellen</span>
             </div>
 
             <div className="directions" style={{ marginTop: 12 }}>
@@ -1200,9 +1174,7 @@ export default function Page() {
                   <li key={i}>
                     <div>{s.instruction}</div>
                     <small>{s.distance_km.toFixed(1)} km · {sToMin(s.duration_s)} min</small>
-                    {!!s.street_names?.length && (
-                      <div className="muted">Straßen (Manöver): {s.street_names.join(", ")}</div>
-                    )}
+                    {!!s.street_names?.length && <div className="muted">Straßen (Manöver): {s.street_names.join(", ")}</div>}
                   </li>
                 ))}
               </ol>
@@ -1216,10 +1188,7 @@ export default function Page() {
         )}
       </div>
 
-      <div
-        ref={containerRef}
-        style={{ width: "100%", height: "100%", minHeight: "600px", background: "#f3f5f7" }}
-      />
+      <div ref={containerRef} style={{ width: "100%", height: "100%", minHeight: "600px", background: "#f3f5f7" }} />
     </div>
   );
 }
