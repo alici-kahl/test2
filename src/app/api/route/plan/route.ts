@@ -1,507 +1,400 @@
-/* app/api/route/plan/route.ts */
-
 import { NextRequest, NextResponse } from "next/server";
 import bboxFn from "@turf/bbox";
-import buffer from "@turf/buffer";
-import booleanIntersects from "@turf/boolean-intersects";
-import centroid from "@turf/centroid";
-import { lineString, polygon, Feature, FeatureCollection, Polygon } from "@turf/helpers";
+import { buffer, booleanIntersects, centroid, featureCollection } from "@turf/turf";
+import type {
+  Feature,
+  FeatureCollection,
+  LineString,
+  Polygon,
+  Geometry,
+} from "geojson";
 
-export const dynamic = "force-dynamic";
-export const maxDuration = 60;
-
-type Coords = [number, number];
+// ---------- Types ----------
+type CorridorMode = "soft" | "hard" | "off";
 
 type PlanReq = {
-  start: Coords;
-  end: Coords;
-  vehicle?: { width_m?: number; height_m?: number; weight_t?: number; axleload_t?: number };
+  start: [number, number];
+  end: [number, number];
+  corridor?: { mode: CorridorMode; width_m: number };
+  roadworks?: { buffer_m: number; only_motorways?: boolean };
+  avoid_target_max?: number;
+  valhalla_soft_max?: number;
+  directions_language?: string;
+  respect_direction?: boolean;
+  vehicle?: {
+    width_m?: number;
+    height_m?: number;
+    weight_t?: number;
+    axleload_t?: number;
+  };
   ts?: string;
   tz?: string;
-  corridor?: { width_m?: number };
-  roadworks?: { buffer_m?: number; only_motorways?: boolean };
-  alternates?: number;
-  directions_language?: string;
 };
 
-function makeSafeBBox(
-  start: Coords,
-  end: Coords,
-  bufferKm: number,
-): [number, number, number, number] {
-  const line = lineString([start, end]);
-  const buffered = buffer(line, bufferKm, { units: "kilometers" });
-  return bboxFn(buffered) as [number, number, number, number];
-}
-
-/** robust: number parsing for values like "12,25", "3.5", 3.5 */
-function toNumOrNull(v: any): number | null {
-  if (v === null || v === undefined || v === "") return null;
-  if (typeof v === "number" && Number.isFinite(v)) return v;
-  const s = String(v).trim();
-  if (!s) return null;
-  const n = Number(s.replace(",", "."));
-  return Number.isFinite(n) ? n : null;
-}
-
-/** robust: true for true/1/"true"/"yes"/"ja" */
-function toBool(v: any): boolean {
-  if (v === true) return true;
-  const s = String(v ?? "").trim().toLowerCase();
-  return s === "1" || s === "true" || s === "yes" || s === "ja";
-}
-
-type Limits = {
-  width_m: number | null;
-  height_m: number | null;
-  weight_t: number | null;
-  axleload_t: number | null;
-  hard_block: boolean;
+type ValhallaResult = {
+  error?: string | null;
+  geojson: FeatureCollection;
 };
 
-function getLimits(p: any): Limits {
-  // direct fields (various naming variants)
-  let width =
-    p.max_width_m ?? p.max_width ?? p.width ?? p.width_limit ?? p.breite ?? null;
-  let height =
-    p.max_height_m ?? p.max_height ?? p.height ?? p.height_limit ?? p.hoehe ?? null;
-  let weight =
-    p.max_weight_t ?? p.max_weight ?? p.weight ?? p.weight_limit ?? p.gewicht ?? null;
-  let axle =
-    p.max_axleload_t ??
-    p.max_axle_t ??
-    p.axleload_t ??
-    p.axle_load_t ??
-    p.axleload ??
-    p.achslast ??
-    null;
-
-  const hard =
-    toBool(p.hard_block) ||
-    toBool(p.hardblock) ||
-    toBool(p.closed) ||
-    toBool(p.blocked) ||
-    toBool(p.road_closed);
-
-  const text = `${p.title || ""} ${p.description || ""} ${p.reason || ""} ${p.subtitle || ""}`;
-
-  // try to extract width from text if missing
-  if (toNumOrNull(width) === null) {
-    const wMatch =
-      text.match(/(?:Breite|width|breite)[^0-9]*([0-9]+(?:[.,][0-9]+)?)\s*m/i) ||
-      text.match(/([0-9]+(?:[.,][0-9]+)?)\s*m\s*(?:Breite|width|breite)/i) ||
-      text.match(/(?:über|over|width)\s*([0-9]+(?:[.,][0-9]+)?)\s*m/i);
-    if (wMatch) width = wMatch[1];
-  }
-
-  // try to extract height from text if missing
-  if (toNumOrNull(height) === null) {
-    const hMatch =
-      text.match(/(?:Höhe|Hoehe|height)[^0-9]*([0-9]+(?:[.,][0-9]+)?)\s*m/i) ||
-      text.match(/([0-9]+(?:[.,][0-9]+)?)\s*m\s*(?:Höhe|Hoehe|height)/i);
-    if (hMatch) height = hMatch[1];
-  }
-
-  // try to extract weight from text if missing
-  if (toNumOrNull(weight) === null) {
-    const wtMatch = text.match(
-      /(?:Gewicht|weight|Last|last)[^0-9]*([0-9]+(?:[.,][0-9]+)?)\s*t/i,
-    );
-    if (wtMatch) weight = wtMatch[1];
-  }
-
-  // try to extract axle load from text if missing
-  if (toNumOrNull(axle) === null) {
-    const aMatch = text.match(/(?:Achslast|axle)[^0-9]*([0-9]+(?:[.,][0-9]+)?)\s*t/i);
-    if (aMatch) axle = aMatch[1];
-  }
-
+// ---------- Helpers ----------
+function getLimits(p: any) {
   return {
-    width_m: toNumOrNull(width),
-    height_m: toNumOrNull(height),
-    weight_t: toNumOrNull(weight),
-    axleload_t: toNumOrNull(axle),
-    hard_block: hard,
+    width_m: p?.limits?.width_m ?? p?.width_m ?? null,
+    height_m: p?.limits?.height_m ?? p?.height_m ?? null,
+    weight_t: p?.limits?.weight_t ?? p?.weight_t ?? null,
+    axleload_t: p?.limits?.axleload_t ?? p?.axleload_t ?? null,
+    hard_block: p?.limits?.hard_block ?? p?.hard_block ?? null,
   };
 }
 
-/**
- * Hard conflict if:
- * - hard_block/closed
- * - or vehicle exceeds any present limit
- */
-function isHardBlockedOrConflicting(
-  limits: Limits,
-  vehicle: { width_m?: number; height_m?: number; weight_t?: number; axleload_t?: number },
-) {
-  if (limits.hard_block) {
-    return { conflict: true, reasons: ["hard_block/closed"] as string[] };
-  }
-
-  const reasons: string[] = [];
-  const vw = toNumOrNull(vehicle.width_m);
-  const vh = toNumOrNull(vehicle.height_m);
-  const vwt = toNumOrNull(vehicle.weight_t);
-  const va = toNumOrNull(vehicle.axleload_t);
-
-  if (vw !== null && limits.width_m !== null && vw > limits.width_m) {
-    reasons.push(`Width ${vw} > ${limits.width_m}`);
-  }
-  if (vh !== null && limits.height_m !== null && vh > limits.height_m) {
-    reasons.push(`Height ${vh} > ${limits.height_m}`);
-  }
-  if (vwt !== null && limits.weight_t !== null && vwt > limits.weight_t) {
-    reasons.push(`Weight ${vwt} > ${limits.weight_t}`);
-  }
-  if (va !== null && limits.axleload_t !== null && va > limits.axleload_t) {
-    reasons.push(`Axle ${va} > ${limits.axleload_t}`);
-  }
-
-  return { conflict: reasons.length > 0, reasons };
+function isHardBlocked(limits: ReturnType<typeof getLimits>) {
+  // Hard-block wenn:
+  // - explizit hard_block true
+  // - oder irgendein Limit gesetzt ist (width/height/weight/axleload)
+  if (limits.hard_block === true) return true;
+  if (limits.width_m != null) return true;
+  if (limits.height_m != null) return true;
+  if (limits.weight_t != null) return true;
+  if (limits.axleload_t != null) return true;
+  return false;
 }
 
-// Avoid-Polygon: immer Rechteck (BBox) – aber skalierbar (kmPad)
-function createAvoidPolygonScaled(f: Feature<any>, kmPad: number): Feature<Polygon> | null {
+function makeSafeBBox(
+  start: [number, number],
+  end: [number, number],
+  paddingDeg = 0.1,
+) {
+  const minLon = Math.min(start[0], end[0]) - paddingDeg;
+  const minLat = Math.min(start[1], end[1]) - paddingDeg;
+  const maxLon = Math.max(start[0], end[0]) + paddingDeg;
+  const maxLat = Math.max(start[1], end[1]) + paddingDeg;
+  return [minLon, minLat, maxLon, maxLat] as [number, number, number, number];
+}
+
+function createAvoidPolygonScaled(
+  obs: Feature,
+  kmPad: number,
+): Feature<Polygon> | null {
   try {
-    if (!f || !f.geometry) return null;
+    // buffer() erwartet km (units: kilometers)
+    const buffered = buffer(obs as any, kmPad, { units: "kilometers" });
+    const geom = buffered?.geometry;
+    if (!geom) return null;
 
-    const degPad = kmPad / 111;
-
-    // 1) Primär: bbox vom gepufferten Feature
-    try {
-      const bf = buffer(f as any, kmPad, { units: "kilometers" }) as any;
-      if (bf) {
-        const b = bboxFn(bf) as [number, number, number, number];
-        return polygon([
-          [
-            [b[0], b[1]],
-            [b[2], b[1]],
-            [b[2], b[3]],
-            [b[0], b[3]],
-            [b[0], b[1]],
-          ],
-        ]);
-      }
-    } catch {
-      // ignore -> fallback
+    // buffer() kann MultiPolygon liefern – wir nehmen Polygon, sonst erste Polygon-Teilfläche
+    if (geom.type === "Polygon") {
+      return buffered as Feature<Polygon>;
     }
-
-    // 2) Fallback: bbox der Originalgeometrie + padding
-    try {
-      const b0 = bboxFn(f as any) as [number, number, number, number];
-      const b: [number, number, number, number] = [
-        b0[0] - degPad,
-        b0[1] - degPad,
-        b0[2] + degPad,
-        b0[3] + degPad,
-      ];
-      return polygon([
-        [
-          [b[0], b[1]],
-          [b[2], b[1]],
-          [b[2], b[3]],
-          [b[0], b[3]],
-          [b[0], b[1]],
-        ],
-      ]);
-    } catch {
-      // ignore -> fallback
+    if (geom.type === "MultiPolygon" && geom.coordinates?.length) {
+      return {
+        type: "Feature",
+        properties: {},
+        geometry: {
+          type: "Polygon",
+          coordinates: geom.coordinates[0] as any,
+        },
+      };
     }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
-    // 3) Letzter Fallback: centroid puffern
-    try {
-      const c = centroid(f as any);
-      const bf = buffer(c as any, kmPad, { units: "kilometers" }) as any;
-      if (!bf) return null;
-      const b = bboxFn(bf) as [number, number, number, number];
-      return polygon([
-        [
-          [b[0], b[1]],
-          [b[2], b[1]],
-          [b[2], b[3]],
-          [b[0], b[3]],
-          [b[0], b[1]],
-        ],
-      ]);
-    } catch {
-      return null;
-    }
+function mergePolygons(
+  polys: Feature<Polygon>[],
+  valhallaSoftMax: number,
+  avoidTargetMax: number,
+) {
+  // Simpler Merge: Wenn > valhallaSoftMax, dann reduzieren wir auf avoidTargetMax
+  // (genaues geometrisches Union ist hier absichtlich NICHT gemacht – Performance/Robustheit)
+  if (polys.length <= valhallaSoftMax) return polys;
+  const target = Math.min(avoidTargetMax, valhallaSoftMax);
+  return polys.slice(0, target);
+}
+
+// ---------- API Calls ----------
+async function callRestrictions(
+  planReq: PlanReq,
+  bbox: [number, number, number, number],
+): Promise<FeatureCollection | null> {
+  try {
+    const url = new URL(`${process.env.NEXT_PUBLIC_BASE_URL ?? ""}/api/restrictions`);
+    url.searchParams.set("bbox", bbox.join(","));
+    const res = await fetch(url.toString(), { cache: "no-store" });
+    if (!res.ok) return null;
+    return (await res.json()) as FeatureCollection;
+  } catch {
+    return null;
+  }
+}
+
+async function callRoadworks(
+  planReq: PlanReq,
+  bbox: [number, number, number, number],
+): Promise<FeatureCollection | null> {
+  try {
+    const url = new URL(`${process.env.NEXT_PUBLIC_BASE_URL ?? ""}/api/roadworks`);
+    url.searchParams.set("bbox", bbox.join(","));
+    url.searchParams.set(
+      "buffer_m",
+      String(planReq.roadworks?.buffer_m ?? 60),
+    );
+    url.searchParams.set(
+      "only_motorways",
+      String(planReq.roadworks?.only_motorways ?? true),
+    );
+    const res = await fetch(url.toString(), { cache: "no-store" });
+    if (!res.ok) return null;
+    return (await res.json()) as FeatureCollection;
   } catch {
     return null;
   }
 }
 
 async function callValhalla(
-  reqBody: any,
+  valhallaBody: any,
   avoidPolys: Feature<Polygon>[],
-): Promise<{ geojson: FeatureCollection; error?: string }> {
-  const payload = {
-    ...reqBody,
-    // Plan->Valhalla Endpoint normalisiert das auf exclude_polygons
-    avoid_polygons: avoidPolys.length > 0 ? avoidPolys.map((p) => p.geometry) : undefined,
-  };
-
+): Promise<ValhallaResult> {
   try {
-    const host = process.env.VERCEL_URL
-      ? `https://${process.env.VERCEL_URL}`
-      : "http://localhost:3000";
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 60000);
-
-    const res = await fetch(`${host}/api/route/valhalla`, {
+    const url = new URL(
+      `${process.env.NEXT_PUBLIC_BASE_URL ?? ""}/api/route/valhalla`,
+    );
+    const res = await fetch(url.toString(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
+      cache: "no-store",
+      body: JSON.stringify({
+        ...valhallaBody,
+        avoid_polygons: avoidPolys.length
+          ? { type: "FeatureCollection", features: avoidPolys }
+          : null,
+      }),
     });
-    clearTimeout(timeoutId);
+
+    const data = await res.json();
 
     if (!res.ok) {
-      const txt = await res.text();
       return {
-        geojson: { type: "FeatureCollection", features: [] },
-        error: `Status ${res.status}: ${txt.slice(0, 200)}`,
+        error: data?.error || `Valhalla error (${res.status})`,
+        geojson: featureCollection([]) as any,
       };
     }
-    const data = await res.json();
-    return { geojson: data.geojson };
+
+    return {
+      error: data?.error ?? null,
+      geojson: data?.geojson ?? featureCollection([]),
+    };
   } catch (e: any) {
-    return { geojson: { type: "FeatureCollection", features: [] }, error: String(e) };
+    return {
+      error: e?.message ?? "Valhalla request failed",
+      geojson: featureCollection([]) as any,
+    };
   }
 }
 
-async function fetchWithTimeout(url: URL, init: RequestInit, ms: number): Promise<Response> {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), ms);
-  try {
-    return await fetch(url, { ...init, signal: ctrl.signal });
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-/* ----------------------------- Main Handler ----------------------------- */
+// ---------- Main ----------
 export async function POST(req: NextRequest) {
-  const body = (await req.json().catch(() => ({}))) as PlanReq;
-  const start = body.start;
-  const end = body.end;
-  const ts = body.ts ?? new Date().toISOString();
-  const tz = body.tz ?? "Europe/Berlin";
+  const body = await req.json();
 
-  const vWidth = body.vehicle?.width_m ?? 2.55;
-  const vWeight = body.vehicle?.weight_t ?? 40;
+  const start = body.start as [number, number];
+  const end = body.end as [number, number];
 
-  console.log(`[PLAN START] Veh: ${vWidth}m / ${vWeight}t`);
+  // bbox padding to search obstacles
+  const bbox = makeSafeBBox(start, end, 0.1);
 
-  // Wichtig: wenn wir „Korridor verlassen“ wollen, muss der Daten-BBox großzügig sein.
-  // (Das beschränkt NICHT Valhalla, sondern nur, welche Hindernisse wir laden.)
-  const queryBBox = makeSafeBBox(start, end, 150);
+  const corridorWidth = Number(body.corridor?.width_m ?? 2000);
+  const roadworksBufferM = Number(body.roadworks?.buffer_m ?? 60);
 
-  let allObstacles: Feature<any>[] = [];
+  const avoidTargetMax = Number(body.avoid_target_max ?? 120);
+  const valhallaSoftMax = Number(body.valhalla_soft_max ?? 80);
 
-  /* 1. Lade Daten */
-  try {
-    const rRes = await fetchWithTimeout(
-      new URL("/api/restrictions", req.nextUrl.origin),
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ts,
-          tz,
-          bbox: queryBBox,
-          buffer_m: 10,
-          vehicle: body.vehicle,
-          max_polygons: 1000,
-        }),
-      },
-      5000,
-    );
-    if (rRes.ok) {
-      const j = await rRes.json();
-      allObstacles.push(...(j.geojson?.features || []));
-    }
-  } catch {}
+  const directionsLanguage = String(body.directions_language ?? "de-DE");
+  const respectDirection = Boolean(body.respect_direction ?? true);
 
-  try {
-    const rwRes = await fetchWithTimeout(
-      new URL("/api/roadworks", req.nextUrl.origin),
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ts,
-          tz,
-          bbox: queryBBox,
-          // Autobahn-fokussiert laden
-          only_motorways: true,
-        }),
-      },
-      5000,
-    );
-    if (rwRes.ok) {
-      const j = await rwRes.json();
-      allObstacles.push(...(j.features || []));
-    }
-  } catch {}
+  const vehicle = body.vehicle ?? {
+    width_m: Number(body.vehicle?.width_m ?? 3),
+    height_m: Number(body.vehicle?.height_m ?? 4),
+    weight_t: Number(body.vehicle?.weight_t ?? 40),
+    axleload_t: Number(body.vehicle?.axleload_t ?? 10),
+  };
 
-  /* 2. Iteration Loop */
-  let currentRouteGeoJSON: FeatureCollection = { type: "FeatureCollection", features: [] };
-  const activeAvoids: Feature<Polygon>[] = [];
+  const planReq: PlanReq = {
+    start,
+    end,
+    corridor: body.corridor ?? { mode: "soft", width_m: corridorWidth },
+    roadworks: {
+      buffer_m: roadworksBufferM,
+      only_motorways: true, // immer Autobahn (wie du willst)
+    },
+    avoid_target_max: avoidTargetMax,
+    valhalla_soft_max: valhallaSoftMax,
+    directions_language: directionsLanguage,
+    respect_direction: respectDirection,
+    vehicle,
+    ts: body.ts,
+    tz: body.tz,
+  };
 
-  // IDs + Versuchszähler pro Hindernis (entscheidend gegen "stuck")
-  const avoidAttempts = new Map<string, number>();
+  const restrictionsFC = await callRestrictions(planReq, bbox);
+  const roadworksFC = await callRoadworks(planReq, bbox);
 
-  let iterations = 0;
-  const MAX_ITERATIONS = 8;
-  let routeIsClean = false;
-  let finalError: string | null = null;
-
-  let lastHardCollisions = 0;
-  let lastAddedAvoids = 0;
+  const allObstacles: Feature[] = [
+    ...(restrictionsFC?.features ?? []),
+    ...(roadworksFC?.features ?? []),
+  ];
 
   const valhallaBody = {
     start,
     end,
-    vehicle: body.vehicle,
-    alternates: body.alternates ?? 1,
-    directions_language: body.directions_language ?? "de-DE",
+    directions_language: directionsLanguage,
+    respect_direction: respectDirection,
+    vehicle,
+    ts: planReq.ts,
+    tz: planReq.tz,
   };
 
-  let fallbackRoute: FeatureCollection | null = null;
+  const MAX_ITERATIONS = 10;
+
+  let iterations = 0;
+  let activeAvoids: Feature<Polygon>[] = [];
+  let currentRouteGeoJSON: FeatureCollection | null = null;
+  let finalError: string | null = null;
+  let lastHardCollisions = 0;
+  let lastAddedAvoids = 0;
+
+  // pro Hindernis-Key merken wir, wie oft wir es schon "vergrößert" haben
+  const avoidAttempts = new Map<string, number>();
 
   while (iterations < MAX_ITERATIONS) {
     iterations++;
-    console.log(`--- ITERATION ${iterations} (Avoids: ${activeAvoids.length}) ---`);
+
+    console.log(
+      `--- Iteration ${iterations} --- Avoids: ${activeAvoids.length}`,
+    );
 
     const result = await callValhalla(valhallaBody, activeAvoids);
 
     if (result.error || !result.geojson.features.length) {
       finalError = result.error || "No route found";
-      console.error(`[FAIL] Iteration ${iterations} failed: ${finalError}`);
-
-      if (fallbackRoute) {
-        console.log("Using fallback route from previous iteration.");
-        currentRouteGeoJSON = fallbackRoute;
-        finalError = null;
-      }
+      console.error(`[FAIL] Iteration ${iterations}: ${finalError}`);
       break;
     }
 
     currentRouteGeoJSON = result.geojson;
-    fallbackRoute = result.geojson;
 
-    const routeLine = currentRouteGeoJSON.features[0];
-    if (!routeLine || routeLine.geometry.type !== "LineString") {
-      finalError = "Invalid route geometry returned by Valhalla";
-      routeIsClean = false;
+    const routeLine = currentRouteGeoJSON.features[0] as Feature<LineString>;
+    const routeBuffer = buffer(routeLine, corridorWidth / 1000, {
+      units: "kilometers",
+    });
+
+    const hardCollisions = allObstacles.filter((obs) => {
+      const p = obs.properties || {};
+      const limits = getLimits(p);
+      if (!isHardBlocked(limits)) return false;
+      return booleanIntersects(routeBuffer, obs as any);
+    });
+
+    lastHardCollisions = hardCollisions.length;
+
+    if (hardCollisions.length === 0) {
+      finalError = null;
+      lastAddedAvoids = 0;
       break;
     }
 
-    // Route-„Hitbox“ (15m)
-    // @ts-ignore
-    const routeBuffer = buffer(routeLine, 0.015, { units: "kilometers" });
+    const before = activeAvoids.length;
 
-    let addedAvoids = 0;
-    let hardCollisions = 0;
-
-    for (const obs of allObstacles) {
-      if (!obs || !obs.geometry) continue;
+    // harte Kollisionen -> avoid hinzufügen
+    for (const obs of hardCollisions) {
+      if (activeAvoids.length >= avoidTargetMax) break;
 
       const p = obs.properties || {};
+      const title = String(p.title ?? "unknown");
 
-      // STABILER obsKey: zuerst echte ID, sonst fallback auf Geometrie-Ausschnitt
-      const obsKey =
-        String(p.id ?? p.source_id ?? p.object_id ?? p.uid ?? "") ||
-        JSON.stringify((obs as any).geometry?.coordinates ?? "").slice(0, 120);
+      const obsKey = String(
+        p.id ??
+          p.oid ??
+          p.osm_id ??
+          // fallback: bbox-string vom obstacle
+          bboxFn(obs as any).map((n) => Number(n.toFixed(6))).join(","),
+      );
 
-      // keine Kollision -> skip
-      if (!booleanIntersects(routeBuffer as any, obs as any)) continue;
+      const attempt = avoidAttempts.get(obsKey) ?? 0;
+      avoidAttempts.set(obsKey, attempt + 1);
 
-      const limits = getLimits(p);
-      const title = p.title || p.description || "unknown";
+      // Skalierung (km): 0.25, 0.5, 1.0, 2.0, 3.0 …
+      const step = attempt;
 
-      const { conflict, reasons } = isHardBlockedOrConflicting(limits, body.vehicle ?? {});
-      if (!conflict) continue;
+      // Aggressives Padding: bei harten Kollisionen brauchen wir oft deutlich mehr Abstand als 60m.
+      // Wir skalieren daher stufenweise hoch (in Kilometern) und erlauben mehr Versuche pro Objekt.
+      const baseKm = Math.max(roadworksBufferM / 1000, 0.25); // mindestens 250m
+      const kmPad =
+        step === 1
+          ? baseKm
+          : step === 2
+            ? 0.5
+            : step === 3
+              ? 1.0
+              : step === 4
+                ? 2.0
+                : 3.0;
 
-      hardCollisions++;
-
-      // Wenn wir dieses Hindernis schon avoided haben, aber es kollidiert weiterhin,
-      // erzeugen wir einen GRÖSSEREN Avoid (statt "stuck").
-      const attempt = (avoidAttempts.get(obsKey) ?? 0) + 1;
-      avoidAttempts.set(obsKey, attempt);
-
-      // Skalierung (km): 20m, 60m, 150m, 300m …
-      const kmPad = attempt === 1 ? 0.02 : attempt === 2 ? 0.06 : attempt === 3 ? 0.15 : 0.3;
-
-      // Sicherheitslimit: nach 4 Versuchen geben wir pro Objekt auf (sonst explodiert Avoid-Menge)
-      if (attempt > 4) {
-        console.warn(`[GIVE UP] "${title.slice(0, 30)}..." still colliding after ${attempt - 1} avoid expansions`);
+      // Sicherheitslimit: nach 12 Versuchen geben wir pro Objekt auf (sonst explodiert Avoid-Menge)
+      if (step > 12) {
+        console.warn(
+          `[GIVE UP] "${title.slice(0, 30)}..." still colliding after ${step - 1} avoid expansions`,
+        );
         continue;
       }
 
-      console.log(
-        `[CONFLICT] "${title.slice(0, 30)}..." -> ${reasons.join(", ")} | avoid_expand_attempt=${attempt} pad=${kmPad}km`,
-      );
+      const poly = createAvoidPolygonScaled(obs as any, kmPad);
+      if (!poly) continue;
 
-      const poly = createAvoidPolygonScaled(obs, kmPad);
-      if (poly) {
-        activeAvoids.push(poly);
-        addedAvoids++;
-      }
+      activeAvoids.push(poly);
     }
 
-    lastHardCollisions = hardCollisions;
-    lastAddedAvoids = addedAvoids;
-
-    if (hardCollisions === 0) {
-      console.log(`[SUCCESS] Clean route found in iteration ${iterations}.`);
-      routeIsClean = true;
-      finalError = null;
-      break;
+    // Soft-Max (Valhalla) respektieren
+    if (activeAvoids.length > valhallaSoftMax) {
+      activeAvoids = mergePolygons(activeAvoids, valhallaSoftMax, avoidTargetMax);
     }
 
-    if (hardCollisions > 0 && addedAvoids === 0) {
+    lastAddedAvoids = activeAvoids.length - before;
+
+    // „stuck“: nichts Neues hinzugefügt
+    if (lastAddedAvoids <= 0) {
       finalError =
         "Route still collides with hard obstacles, but no new avoids can be added (stuck).";
-      console.error(`[STUCK] ${finalError}`);
-      routeIsClean = false;
       break;
     }
   }
 
-  /* 3. Warnings */
+  const routeIsClean =
+    !!currentRouteGeoJSON && finalError === null && lastHardCollisions === 0;
+
+  // warnings fürs Frontend (max 20)
   const warnings: any[] = [];
-  try {
-    if (currentRouteGeoJSON.features.length > 0) {
-      const routeLine = currentRouteGeoJSON.features[0];
-      // @ts-ignore
-      const routeBuffer = buffer(routeLine, 0.02, { units: "kilometers" });
+  if (currentRouteGeoJSON?.features?.length) {
+    const routeLine = currentRouteGeoJSON.features[0] as Feature<LineString>;
+    const routeBuffer = buffer(routeLine, corridorWidth / 1000, {
+      units: "kilometers",
+    });
 
-      for (const obs of allObstacles) {
-        if (!obs || !obs.geometry) continue;
-
-        const p = obs.properties || {};
-        const obsId =
-          String(p.id ?? p.source_id ?? p.object_id ?? p.uid ?? "") ||
-          JSON.stringify((obs as any).geometry?.coordinates ?? "").slice(0, 120);
-
-        if (booleanIntersects(routeBuffer as any, obs as any)) {
-          const limits = getLimits(p);
-          warnings.push({
-            id: p.id ?? obsId,
-            title: p.title || "Baustelle ohne Einschränkung",
-            description: p.description,
-            limits,
-            coords: centroid(obs as any).geometry.coordinates,
-          });
-          if (warnings.length > 20) break;
-        }
-      }
+    for (const obs of allObstacles) {
+      if (!booleanIntersects(routeBuffer, obs as any)) continue;
+      const p = obs.properties || {};
+      warnings.push({
+        id: p.id ?? p.oid ?? p.osm_id ?? p.title ?? "unknown",
+        title: p.title || "Baustelle ohne Einschränkung",
+        description: p.description,
+        limits: getLimits(p),
+        coords: centroid(obs as any).geometry.coordinates,
+      });
+      if (warnings.length >= 20) break;
     }
-  } catch {}
+  }
 
+  // Wenn nicht clean -> HTTP 409, damit Frontend es nicht als "OK" behandelt
   const statusCode = routeIsClean ? 200 : 409;
 
   return NextResponse.json(
@@ -516,7 +409,7 @@ export async function POST(req: NextRequest) {
         added_avoids_last_iter: lastAddedAvoids,
       },
       avoid_applied: { total: activeAvoids.length },
-      geojson: currentRouteGeoJSON,
+      geojson: currentRouteGeoJSON ?? featureCollection([]),
       warnings,
     },
     { status: statusCode },
