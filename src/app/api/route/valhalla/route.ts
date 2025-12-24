@@ -1,167 +1,249 @@
 // src/app/api/route/valhalla/route.ts
 import { NextRequest, NextResponse } from "next/server";
 
-export const dynamic = "force-dynamic";
+/**
+ * Reliable wrapper around Valhalla's /route.
+ * Always returns JSON (never plain-text errors), so the frontend never crashes on JSON.parse().
+ *
+ * Expected input (minimal):
+ * {
+ *   start: [lon, lat],
+ *   end:   [lon, lat],
+ *   vehicle: { width_m?: number, height_m?: number, weight_t?: number, axleload_t?: number },
+ *   options?: {
+ *     alternatives?: number,
+ *     directions_language?: string,
+ *     avoid_polygons?: GeoJSON.Polygon[],
+ *     exclude_polygons?: GeoJSON.Polygon[],
+ *     soft_avoid?: boolean,
+ *     avoid_penalty_s?: number
+ *   }
+ * }
+ */
 
-type Coords = [number, number];
+type LonLat = [number, number];
 
-type VehicleSpec = {
+type Vehicle = {
   width_m?: number;
   height_m?: number;
   weight_t?: number;
   axleload_t?: number;
 };
 
-function decodePolyline6(str: string): [number, number][] {
-  let index = 0, lat = 0, lng = 0;
-  const coordinates: [number, number][] = [];
-  const shiftAndMask = () => {
-    let result = 0, shift = 0, b: number;
+type ValhallaOptions = {
+  alternatives?: number;
+  directions_language?: string;
+  avoid_polygons?: any[]; // GeoJSON Polygons
+  exclude_polygons?: any[]; // GeoJSON Polygons
+  soft_avoid?: boolean;
+  avoid_penalty_s?: number;
+};
+
+function decodePolyline6(str: string): LonLat[] {
+  // Valhalla returns polyline6 in trip.legs[*].shape.
+  let index = 0;
+  let lat = 0;
+  let lon = 0;
+  const coords: LonLat[] = [];
+
+  while (index < str.length) {
+    let b: number;
+    let shift = 0;
+    let result = 0;
+
     do {
       b = str.charCodeAt(index++) - 63;
       result |= (b & 0x1f) << shift;
       shift += 5;
     } while (b >= 0x20);
-    return (result & 1) ? ~(result >> 1) : (result >> 1);
-  };
-  while (index < str.length) {
-    lat += shiftAndMask();
-    lng += shiftAndMask();
-    coordinates.push([lng / 1e6, lat / 1e6]);
+
+    const dlat = (result & 1) ? ~(result >> 1) : result >> 1;
+    lat += dlat;
+
+    shift = 0;
+    result = 0;
+
+    do {
+      b = str.charCodeAt(index++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+
+    const dlon = (result & 1) ? ~(result >> 1) : result >> 1;
+    lon += dlon;
+
+    coords.push([lon / 1e6, lat / 1e6]);
   }
-  return coordinates;
+
+  return coords;
 }
 
-function toFeatureLine(coords: [number, number][], properties: any = {}) {
-  return { type: "Feature" as const, geometry: { type: "LineString" as const, coordinates: coords }, properties };
-}
-
-function valhallaToGeoJSON(response: any) {
-  const trip = response?.trip;
-  if (!trip) return { type: "FeatureCollection", features: [] as any[] };
-
-  const features: any[] = [];
-  (trip.legs || []).forEach((leg: any, idx: number) => {
-    const coords = decodePolyline6(leg.shape || "");
-    const summary = leg.summary || {};
-    const props: any = {
-      leg_index: idx,
-      summary: { distance_km: Number(summary.length || 0), duration_s: Number(summary.time || 0) },
-      maneuvers: (leg.maneuvers || []).map((m: any) => ({
-        instruction: m.instruction,
-        distance_km: Number(m.length || 0),
-        duration_s: Number(m.time || 0),
-        street_names: m.street_names || [],
-      })),
-      streets_sequence: (leg.maneuvers || []).flatMap((m: any) => m.street_names || []).filter(Boolean),
+function valhallaToGeoJSON(valhalla: any) {
+  const shape: string | undefined = valhalla?.trip?.legs?.[0]?.shape;
+  if (!shape) {
+    return {
+      type: "FeatureCollection",
+      features: [],
     };
-    features.push(toFeatureLine(coords, props));
-  });
+  }
 
-  return { type: "FeatureCollection" as const, features };
+  const coordinates = decodePolyline6(shape);
+  const maneuvers =
+    valhalla?.trip?.legs?.[0]?.maneuvers?.map((m: any) => ({
+      instruction: m.instruction,
+      distance_km: m.length,
+      duration_s: m.time,
+      street_names: Array.isArray(m.street_names) ? m.street_names : [],
+    })) ?? [];
+
+  const summary = {
+    distance_km: valhalla?.trip?.summary?.length ?? null,
+    duration_s: valhalla?.trip?.summary?.time ?? null,
+  };
+
+  return {
+    type: "FeatureCollection",
+    features: [
+      {
+        type: "Feature",
+        geometry: { type: "LineString", coordinates },
+        properties: { leg_index: 0, summary, maneuvers },
+      },
+    ],
+  };
 }
 
 function buildValhallaRequest(
-  start: Coords,
-  end: Coords,
-  v: VehicleSpec,
-  options: { avoid_polygons?: any[]; directions_language?: string; alternates?: number } = {}
+  start: LonLat,
+  end: LonLat,
+  vehicle: Vehicle,
+  opts: ValhallaOptions
 ) {
-  const costing = "truck";
-  const hasAvoids = Array.isArray(options.avoid_polygons) && options.avoid_polygons.length > 0;
+  const {
+    alternatives = 1,
+    directions_language = "de-DE",
+    avoid_polygons = [],
+    exclude_polygons = [],
+    soft_avoid = true,
+    avoid_penalty_s = 900, // 15 minutes; strong but still routable
+  } = opts;
 
-  const truckCosting: any = {
-    width: v.width_m ?? 2.55,
-    height: v.height_m ?? 4.0,
-    weight: (v.weight_t ?? 40) * 1000,
-    axle_load: (v.axleload_t ?? 10) * 1000,
-
-    // Avoids: stark, aber routbar
-    use_highways: hasAvoids ? 0.7 : 1.0,
-    shortest: false,
-
-    maneuver_penalty: hasAvoids ? 250 : 5,
-    gate_penalty: hasAvoids ? 50_000 : 300,
-    service_penalty: hasAvoids ? 50_000 : 0,
-
-    country_crossing_penalty: 0,
-    hazmat: true,
-  };
-
-  const json: any = {
-    locations: [{ lon: start[0], lat: start[1] }, { lon: end[0], lat: end[1] }],
-    costing,
-    costing_options: { truck: truckCosting },
-    directions_options: {
-      language: options.directions_language || "de-DE",
-      units: "kilometers",
+  const costingOptions: any = {
+    truck: {
+      width: vehicle.width_m,
+      height: vehicle.height_m,
+      weight: vehicle.weight_t,
+      axle_load: vehicle.axleload_t,
     },
-    alternates: options.alternates ?? 1,
   };
 
-  if (hasAvoids) {
-    json.avoid_polygons = options.avoid_polygons;
-    json.exclude_polygons = options.avoid_polygons;
+  // Soft avoids => strong penalties, but do not hard-fail early.
+  if (soft_avoid && (avoid_polygons.length || exclude_polygons.length)) {
+    costingOptions.truck.use_highways = 0.6; // slightly reduce highway preference, improves detours
+    costingOptions.truck.use_tolls = 0.8;
+    costingOptions.truck.use_ferry = 0.8;
+    costingOptions.truck.use_tracks = 0.2;
+    // Not guaranteed in every Valhalla build; harmless if ignored.
+    costingOptions.truck.avoid_penalty = avoid_penalty_s;
   }
 
-  return json;
+  const req: any = {
+    locations: [
+      { lon: start[0], lat: start[1], type: "break" },
+      { lon: end[0], lat: end[1], type: "break" },
+    ],
+    costing: "truck",
+    costing_options: costingOptions,
+    directions_options: { language: directions_language },
+    alternatives,
+  };
+
+  if (avoid_polygons?.length) req.avoid_polygons = avoid_polygons;
+  if (exclude_polygons?.length) req.exclude_polygons = exclude_polygons;
+
+  return req;
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(id);
+  }
 }
 
 export async function POST(req: NextRequest) {
-  const body = (await req.json().catch(() => ({}))) as any;
-  const start: Coords = body.start ?? [6.96, 50.94];
-  const end: Coords = body.end ?? [8.68, 50.11];
-  const vehicle: VehicleSpec = body.vehicle ?? {};
-
-  const geoms: any[] = [];
-  const pushGeom = (x: any) => {
-    if (!x) return;
-    if (x.type === "Polygon" || x.type === "MultiPolygon") geoms.push(x);
-    else if (x.geometry) geoms.push(x.geometry);
-  };
-
-  // akzeptiere beide keys
-  const srcAvoid = body.avoid_polygons ?? body.exclude_polygons;
-
-  if (srcAvoid) {
-    if (Array.isArray(srcAvoid)) srcAvoid.forEach(pushGeom);
-    else if (srcAvoid.features) srcAvoid.features.forEach((f: any) => pushGeom(f));
-  }
-
-  const valhallaURL = process.env.VALHALLA_URL || "http://localhost:8002/route";
-  const requestJson = buildValhallaRequest(start, end, vehicle, {
-    avoid_polygons: geoms,
-    directions_language: body.directions_language || "de-DE",
-    alternates: body.alternates,
-  });
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45000);
-
   try {
-    const vr = await fetch(valhallaURL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requestJson),
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
+    const body = await req.json();
 
-    if (!vr.ok) {
-      const text = await vr.text();
-      return NextResponse.json({ error: text, status: vr.status }, { status: 500 });
+    const start: LonLat = body?.start;
+    const end: LonLat = body?.end;
+    const vehicle: Vehicle = body?.vehicle ?? {};
+    const options: ValhallaOptions = body?.options ?? {};
+
+    if (!Array.isArray(start) || start.length !== 2 || !Array.isArray(end) || end.length !== 2) {
+      return NextResponse.json(
+        { error: "Invalid input: start/end must be [lon,lat]." },
+        { status: 400 }
+      );
     }
 
-    const parsed = await vr.json();
-    const fc = valhallaToGeoJSON(parsed);
+    const valhallaURL = process.env.VALHALLA_URL || "http://localhost:8002/route";
+    const requestJson = buildValhallaRequest(start, end, vehicle, options);
 
-    return NextResponse.json({
-      avoid_count: geoms.length,
-      raw_status: parsed?.trip?.status ?? null,
-      geojson: fc,
-    });
-  } catch (e: any) {
-    clearTimeout(timeout);
-    return NextResponse.json({ error: String(e), type: "FetchError" }, { status: 500 });
+    const vr = await fetchWithTimeout(
+      valhallaURL,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestJson),
+      },
+      8000
+    );
+
+    const rawText = await vr.text();
+    let parsed: any = null;
+
+    try {
+      parsed = JSON.parse(rawText);
+    } catch {
+      return NextResponse.json(
+        {
+          error: "VALHALLA_NON_JSON_RESPONSE",
+          status: vr.status,
+          raw: rawText?.slice(0, 2000),
+        },
+        { status: 502 }
+      );
+    }
+
+    if (!vr.ok) {
+      return NextResponse.json(
+        {
+          error: "VALHALLA_ERROR",
+          status: vr.status,
+          valhalla: parsed,
+        },
+        { status: 502 }
+      );
+    }
+
+    const geojson = valhallaToGeoJSON(parsed);
+
+    return NextResponse.json(
+      {
+        ok: true,
+        geojson,
+        raw: parsed,
+      },
+      { status: 200 }
+    );
+  } catch (err: any) {
+    return NextResponse.json(
+      { error: "VALHALLA_ROUTE_HANDLER_ERROR", message: err?.message ?? String(err) },
+      { status: 500 }
+    );
   }
 }
