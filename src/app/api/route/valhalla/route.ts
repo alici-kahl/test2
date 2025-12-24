@@ -1,7 +1,7 @@
-// src/app/api/route/valhalla/route.ts
 import { NextRequest, NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 type Coords = [number, number];
 
@@ -13,16 +13,20 @@ type VehicleSpec = {
 };
 
 function decodePolyline6(str: string): [number, number][] {
-  let index = 0, lat = 0, lng = 0;
+  let index = 0,
+    lat = 0,
+    lng = 0;
   const coordinates: [number, number][] = [];
   const shiftAndMask = () => {
-    let result = 0, shift = 0, b: number;
+    let result = 0,
+      shift = 0,
+      b: number;
     do {
       b = str.charCodeAt(index++) - 63;
       result |= (b & 0x1f) << shift;
       shift += 5;
     } while (b >= 0x20);
-    return (result & 1) ? ~(result >> 1) : (result >> 1);
+    return result & 1 ? ~(result >> 1) : result >> 1;
   };
   while (index < str.length) {
     lat += shiftAndMask();
@@ -33,7 +37,11 @@ function decodePolyline6(str: string): [number, number][] {
 }
 
 function toFeatureLine(coords: [number, number][], properties: any = {}) {
-  return { type: "Feature" as const, geometry: { type: "LineString" as const, coordinates: coords }, properties };
+  return {
+    type: "Feature" as const,
+    geometry: { type: "LineString" as const, coordinates: coords },
+    properties,
+  };
 }
 
 function valhallaToGeoJSON(response: any) {
@@ -46,14 +54,19 @@ function valhallaToGeoJSON(response: any) {
     const summary = leg.summary || {};
     const props: any = {
       leg_index: idx,
-      summary: { distance_km: Number(summary.length || 0), duration_s: Number(summary.time || 0) },
+      summary: {
+        distance_km: Number(summary.length || 0),
+        duration_s: Number(summary.time || 0),
+      },
       maneuvers: (leg.maneuvers || []).map((m: any) => ({
         instruction: m.instruction,
         distance_km: Number(m.length || 0),
         duration_s: Number(m.time || 0),
         street_names: m.street_names || [],
       })),
-      streets_sequence: (leg.maneuvers || []).flatMap((m: any) => m.street_names || []).filter(Boolean),
+      streets_sequence: (leg.maneuvers || [])
+        .flatMap((m: any) => m.street_names || [])
+        .filter(Boolean),
     };
     features.push(toFeatureLine(coords, props));
   });
@@ -65,10 +78,15 @@ function buildValhallaRequest(
   start: Coords,
   end: Coords,
   v: VehicleSpec,
-  options: { avoid_polygons?: any[]; directions_language?: string; alternates?: number } = {}
+  options: {
+    avoid_polygons?: any[];
+    directions_language?: string;
+    alternates?: number;
+  } = {}
 ) {
   const costing = "truck";
-  const hasAvoids = Array.isArray(options.avoid_polygons) && options.avoid_polygons.length > 0;
+  const hasAvoids =
+    Array.isArray(options.avoid_polygons) && options.avoid_polygons.length > 0;
 
   const truckCosting: any = {
     width: v.width_m ?? 2.55,
@@ -76,7 +94,7 @@ function buildValhallaRequest(
     weight: (v.weight_t ?? 40) * 1000,
     axle_load: (v.axleload_t ?? 10) * 1000,
 
-    // Avoids: stark, aber routbar
+    // Avoids: stark, aber routbar (kein "Atombomben"-Penalty)
     use_highways: hasAvoids ? 0.7 : 1.0,
     shortest: false,
 
@@ -100,6 +118,7 @@ function buildValhallaRequest(
   };
 
   if (hasAvoids) {
+    // beide Keys setzen (kompatibel)
     json.avoid_polygons = options.avoid_polygons;
     json.exclude_polygons = options.avoid_polygons;
   }
@@ -122,7 +141,6 @@ export async function POST(req: NextRequest) {
 
   // akzeptiere beide keys
   const srcAvoid = body.avoid_polygons ?? body.exclude_polygons;
-
   if (srcAvoid) {
     if (Array.isArray(srcAvoid)) srcAvoid.forEach(pushGeom);
     else if (srcAvoid.features) srcAvoid.features.forEach((f: any) => pushGeom(f));
@@ -136,7 +154,7 @@ export async function POST(req: NextRequest) {
   });
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45000);
+  const timeout = setTimeout(() => controller.abort(), 25_000); // schneller failen, damit Plan-Route nicht 504t
 
   try {
     const vr = await fetch(valhallaURL, {
@@ -147,12 +165,16 @@ export async function POST(req: NextRequest) {
     });
     clearTimeout(timeout);
 
+    // IMMER JSON zurückgeben (sonst knallt dein Frontend beim JSON.parse)
     if (!vr.ok) {
-      const text = await vr.text();
-      return NextResponse.json({ error: text, status: vr.status }, { status: 500 });
+      const text = await vr.text().catch(() => "");
+      return NextResponse.json(
+        { error: text || "Valhalla Fehler", status: vr.status, geojson: { type: "FeatureCollection", features: [] } },
+        { status: 200 }
+      );
     }
 
-    const parsed = await vr.json();
+    const parsed = await vr.json().catch(() => null);
     const fc = valhallaToGeoJSON(parsed);
 
     return NextResponse.json({
@@ -162,6 +184,9 @@ export async function POST(req: NextRequest) {
     });
   } catch (e: any) {
     clearTimeout(timeout);
-    return NextResponse.json({ error: String(e), type: "FetchError" }, { status: 500 });
+    return NextResponse.json(
+      { error: String(e), type: "FetchError", geojson: { type: "FeatureCollection", features: [] } },
+      { status: 200 }
+    );
   }
 }
