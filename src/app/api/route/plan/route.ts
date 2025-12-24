@@ -27,8 +27,6 @@ type PlanReq = {
   respect_direction?: boolean;
 };
 
-/* ---------- Helpers ---------- */
-
 function makeSafeBBox(start: Coords, end: Coords, bufferKm: number): [number, number, number, number] {
   const line = lineString([start, end]);
   const buffered = buffer(line, bufferKm, { units: "kilometers" });
@@ -110,8 +108,6 @@ async function postJSON<T>(origin: string, path: string, body: any): Promise<T |
   }
 }
 
-/* ---------- Main ---------- */
-
 export async function POST(req: NextRequest) {
   const body = (await req.json().catch(() => ({}))) as PlanReq;
 
@@ -124,11 +120,13 @@ export async function POST(req: NextRequest) {
   const vWidth = body.vehicle?.width_m ?? 2.55;
   const vWeight = body.vehicle?.weight_t ?? 40;
 
-  const MAX_ITERATIONS = 6;
+  // Mehr Freiheit:
+  const MAX_ITERATIONS = 10;
   const ROUTE_BUFFER_KM = 0.02;
-  const valhallaSoftMax = body.valhalla_soft_max ?? 80;
+  const valhallaSoftMax = body.valhalla_soft_max ?? 200;
 
-  const bbox = makeSafeBBox(start, end, 50);
+  // Mehr Freiheit: größeren Suchraum erlauben
+  const bbox = makeSafeBBox(start, end, 150);
   const origin = req.nextUrl.origin;
 
   const obstacles: Feature<any>[] = [];
@@ -136,7 +134,8 @@ export async function POST(req: NextRequest) {
   const rw = await postJSON<{ features: Feature<any>[] }>(origin, "/api/roadworks", {
     ts, tz, bbox,
     buffer_m: body.roadworks?.buffer_m ?? 60,
-    only_motorways: body.roadworks?.only_motorways ?? true,
+    // Mehr Freiheit: default NICHT motorway-only, sonst gibt es oft keine Umfahrung
+    only_motorways: body.roadworks?.only_motorways ?? false,
   });
 
   if (rw?.features?.length) obstacles.push(...rw.features);
@@ -156,7 +155,8 @@ export async function POST(req: NextRequest) {
       start,
       end,
       vehicle: body.vehicle,
-      alternates: body.alternates ?? 1,
+      // Mehr Freiheit: standardmäßig mehr Alternativen zulassen
+      alternates: body.alternates ?? 2,
       directions_language: body.directions_language ?? "de-DE",
       respect_direction: body.respect_direction ?? true,
     }, avoids);
@@ -195,6 +195,7 @@ export async function POST(req: NextRequest) {
       break;
     }
 
+    // Wenn wir keinen neuen Avoid mehr hinzufügen können, sind wir "stuck"
     if (added === 0) {
       finalError = "Route blocked - no valid detour possible";
       break;
@@ -206,6 +207,7 @@ export async function POST(req: NextRequest) {
     }
   }
 
+  // Finaler Check: wenn Route noch blockiert, immer BLOCKED
   if (route.features.length) {
     const line = route.features[0];
     const routeBuffer = buffer(line as any, ROUTE_BUFFER_KM, { units: "kilometers" });
