@@ -74,12 +74,13 @@ function createAvoidPolygon(f: Feature<any>): Feature<Polygon> | null {
 async function callValhalla(reqBody: any, avoidPolys: Feature<Polygon>[]) {
   const payload = {
     ...reqBody,
-    avoid_polygons: avoidPolys.length ? avoidPolys.map(p => p.geometry) : undefined,
+    // wichtig: Valhalla erwartet Geometrien
+    avoid_polygons: avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined,
+    // optionaler Kompat-Key (schadet nicht, hilft je nach Setup)
+    exclude_polygons: avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined,
   };
 
-  const host = process.env.VERCEL_URL
-    ? `https://${process.env.VERCEL_URL}`
-    : "http://localhost:3000";
+  const host = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "http://localhost:3000";
 
   const res = await fetch(`${host}/api/route/valhalla`, {
     method: "POST",
@@ -120,21 +121,23 @@ export async function POST(req: NextRequest) {
   const vWidth = body.vehicle?.width_m ?? 2.55;
   const vWeight = body.vehicle?.weight_t ?? 40;
 
-  // Mehr Freiheit:
+  // Mehr Freiheit (Option A):
   const MAX_ITERATIONS = 10;
   const ROUTE_BUFFER_KM = 0.02;
   const valhallaSoftMax = body.valhalla_soft_max ?? 200;
 
-  // Mehr Freiheit: größeren Suchraum erlauben
+  // Größerer Suchraum für Umfahrungen
   const bbox = makeSafeBBox(start, end, 150);
   const origin = req.nextUrl.origin;
 
   const obstacles: Feature<any>[] = [];
 
   const rw = await postJSON<{ features: Feature<any>[] }>(origin, "/api/roadworks", {
-    ts, tz, bbox,
+    ts,
+    tz,
+    bbox,
     buffer_m: body.roadworks?.buffer_m ?? 60,
-    // Mehr Freiheit: default NICHT motorway-only, sonst gibt es oft keine Umfahrung
+    // default: nicht motorway-only (sonst gibt es oft keine Umfahrungen)
     only_motorways: body.roadworks?.only_motorways ?? false,
   });
 
@@ -151,18 +154,21 @@ export async function POST(req: NextRequest) {
   while (iterations < MAX_ITERATIONS) {
     iterations++;
 
-    const res = await callValhalla({
-      start,
-      end,
-      vehicle: body.vehicle,
-      // Mehr Freiheit: standardmäßig mehr Alternativen zulassen
-      alternates: body.alternates ?? 2,
-      directions_language: body.directions_language ?? "de-DE",
-      respect_direction: body.respect_direction ?? true,
-    }, avoids);
+    const res = await callValhalla(
+      {
+        start,
+        end,
+        vehicle: body.vehicle,
+        alternates: body.alternates ?? 2,
+        directions_language: body.directions_language ?? "de-DE",
+        respect_direction: body.respect_direction ?? true,
+      },
+      avoids
+    );
 
     if (!res?.geojson?.features?.length) {
       finalError = res?.error ?? "No route found";
+      route = { type: "FeatureCollection", features: [] };
       break;
     }
 
@@ -207,7 +213,7 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // Finaler Check: wenn Route noch blockiert, immer BLOCKED
+  // Finaler Check: blockierende Stellen als Warnings sammeln (aber Route trotzdem zurückgeben)
   if (route.features.length) {
     const line = route.features[0];
     const routeBuffer = buffer(line as any, ROUTE_BUFFER_KM, { units: "kilometers" });
@@ -227,9 +233,16 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  if (blockingWarnings.length) {
-    routeIsClean = false;
-    if (!finalError) finalError = "Route blocked by obstacles";
+  // Status-Logik (Option A):
+  // - CLEAN: Route existiert & keine blockierenden Warnungen
+  // - WARN: Route existiert, aber es gibt blockierende Stellen (best effort)
+  // - BLOCKED: keine Route gefunden
+  let status: "CLEAN" | "WARN" | "BLOCKED" = "BLOCKED";
+  if (route.features.length) status = blockingWarnings.length ? "WARN" : "CLEAN";
+  routeIsClean = status === "CLEAN";
+
+  if (status !== "CLEAN" && !finalError) {
+    finalError = status === "WARN" ? "Route hat blockierende Stellen (Best-Effort)" : "No route found";
   }
 
   return NextResponse.json({
@@ -238,8 +251,13 @@ export async function POST(req: NextRequest) {
       iterations,
       avoids_applied: avoids.length,
       clean: routeIsClean,
-      status: routeIsClean ? "CLEAN" : "BLOCKED",
+      status,
       error: finalError,
+      roadworks: {
+        after_merge: avoids.length,
+        avoid_polygons: avoids.length,
+        limit_hit: avoids.length >= valhallaSoftMax,
+      },
     },
     avoid_applied: { total: avoids.length },
     geojson: route,
