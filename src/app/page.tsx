@@ -80,6 +80,35 @@ function formatSuggestion(row: any): string | null {
   return [streetPart, placePart].filter(Boolean).join(", ");
 }
 
+// --- Robust JSON fetch helper (fix: 504/HTML -> "not valid JSON") ---
+async function readJsonOrText(res: Response): Promise<{ ok: boolean; status: number; json?: any; text?: string }> {
+  const status = res.status;
+  const ok = res.ok;
+
+  // Prefer text(), then parse JSON if possible (covers HTML error pages)
+  const txt = await res.text();
+
+  // Try JSON parse if it looks like JSON
+  const trimmed = txt.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const json = JSON.parse(trimmed);
+      return { ok, status, json };
+    } catch {
+      // fall through
+    }
+  }
+  return { ok, status, text: txt };
+}
+
+function explainHttp(status: number) {
+  if (status === 504) return "Server hat zu lange gebraucht (504 Gateway Timeout). Bitte erneut versuchen oder Suchraum/Iterationen reduzieren.";
+  if (status === 502) return "Server/Proxy-Fehler (502). Bitte erneut versuchen.";
+  if (status === 500) return "Serverfehler (500).";
+  if (status === 429) return "Zu viele Anfragen (429). Bitte kurz warten.";
+  return `HTTP ${status}`;
+}
+
 // -------------------- Autocomplete --------------------
 function AutocompleteInput(props: {
   value: string;
@@ -674,10 +703,25 @@ export default function Page() {
 
     const emptyFC = { type: "FeatureCollection", features: [] as any[] };
 
+    // --- FIX: Start/Ziel-Punkte auch zeigen, wenn keine Route vorhanden (BLOCKED) ---
+    const pts: any[] = [];
+    if (startCoord)
+      pts.push({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: startCoord },
+        properties: { role: "start" },
+      });
+    if (endCoord)
+      pts.push({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: endCoord },
+        properties: { role: "end" },
+      });
+    safeSetGeoJSONSource(map, "points", { type: "FeatureCollection", features: pts });
+
     if (!geojson) {
       safeSetGeoJSONSource(map, "route-active", emptyFC);
       safeSetGeoJSONSource(map, "route-alts", emptyFC);
-      safeSetGeoJSONSource(map, "points", emptyFC);
       setSteps([]);
       setStreets([]);
       return;
@@ -701,24 +745,6 @@ export default function Page() {
     const maneuvers = active?.properties?.maneuvers ?? [];
     setSteps(maneuvers);
     setStreets(active?.properties?.streets_sequence ?? []);
-
-    const pts: any[] = [];
-    if (startCoord)
-      pts.push({
-        type: "Feature",
-        geometry: { type: "Point", coordinates: startCoord },
-        properties: { role: "start" },
-      });
-    if (endCoord)
-      pts.push({
-        type: "Feature",
-        geometry: { type: "Point", coordinates: endCoord },
-        properties: { role: "end" },
-      });
-    safeSetGeoJSONSource(map, "points", {
-      type: "FeatureCollection",
-      features: pts,
-    });
 
     const bbox: [number, number, number, number] | undefined = active?.properties?.bbox;
     if (bbox) {
@@ -752,10 +778,11 @@ export default function Page() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ts, tz, bbox }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.error || "HTTP " + res.status);
 
-      const fc = data as { type: string; features: any[]; meta: any };
+      const parsed = await readJsonOrText(res);
+      if (!parsed.ok) throw new Error(parsed.json?.error || parsed.text || explainHttp(parsed.status));
+
+      const fc = parsed.json as { type: string; features: any[]; meta: any };
 
       const lineSrc = map.getSource("roadworks-lines") as maplibregl.GeoJSONSource | undefined;
       if (lineSrc) lineSrc.setData(fc as any);
@@ -836,8 +863,6 @@ export default function Page() {
       setStartCoord(start);
       setEndCoord(end);
 
-      let data: any = null;
-
       // vor jedem Plan resetten
       setPlanBlocked(null);
 
@@ -867,12 +892,28 @@ export default function Page() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
-        data = await res.json();
-        if (!res.ok) {
-          alert("Planner-Fehler: " + JSON.stringify(data?.error || data));
+
+        const parsed = await readJsonOrText(res);
+        if (!parsed.ok) {
+          // FIX: Kein JSON => trotzdem saubere UI-Fehlermeldung statt Crash/alert
+          const msg =
+            parsed.json?.error ||
+            (parsed.status ? explainHttp(parsed.status) : "Unbekannter Fehler") ||
+            "Fehler beim Planen.";
           setPlanMeta(null);
+          setGeojson(null);
+          setActiveIdx(0);
+          setSteps([]);
+          setStreets([]);
+          setPlanBlocked({
+            error: `Planer-Fehler: ${msg}`,
+            warnings: [],
+            meta: { status: "BLOCKED", error: msg },
+          });
           return;
         }
+
+        const data = parsed.json;
 
         const m = data?.meta?.roadworks || {};
         setPlanMeta({
@@ -891,7 +932,8 @@ export default function Page() {
           setSteps([]);
           setStreets([]);
           setPlanBlocked({
-            error: data?.meta?.error ?? "Route ist blockiert.",
+            // Deutsch + eindeutig
+            error: data?.meta?.error ? `Keine passende Umfahrung gefunden: ${data.meta.error}` : "Keine passende Umfahrung gefunden.",
             warnings: Array.isArray(data?.blocking_warnings) ? data.blocking_warnings : [],
             meta: data?.meta ?? null,
           });
@@ -900,7 +942,10 @@ export default function Page() {
 
           if (data?.meta?.status === "WARN") {
             setPlanBlocked({
-              error: data?.meta?.error ?? "Route hat blockierende Stellen (Best-Effort).",
+              // Deutsch + eindeutig
+              error: data?.meta?.error
+                ? `Route gefunden, aber keine alternative Umfahrung gefunden: ${data.meta.error}`
+                : "Route gefunden, aber es gibt blockierende Stellen (Best-Effort).",
               warnings: Array.isArray(data?.blocking_warnings) ? data.blocking_warnings : [],
               meta: data?.meta ?? null,
             });
@@ -921,12 +966,24 @@ export default function Page() {
             alternates,
           }),
         });
-        data = await res.json();
-        if (!res.ok) {
-          alert("Valhalla-Fehler: " + JSON.stringify(data?.error || data));
+
+        const parsed = await readJsonOrText(res);
+        if (!parsed.ok) {
+          const msg = parsed.json?.error || parsed.text || explainHttp(parsed.status);
           setPlanMeta(null);
+          setGeojson(null);
+          setActiveIdx(0);
+          setSteps([]);
+          setStreets([]);
+          setPlanBlocked({
+            error: `Valhalla-Fehler: ${msg}`,
+            warnings: [],
+            meta: { status: "BLOCKED", error: msg },
+          });
           return;
         }
+
+        const data = parsed.json;
         setPlanMeta(null);
         setGeojson(data.geojson);
         setPlanBlocked(null);
@@ -936,6 +993,7 @@ export default function Page() {
       mapRef.current?.resize();
       refreshRoadworks();
     } catch (e: any) {
+      // bleibt als letzter Schutz
       alert(String(e));
     } finally {
       setLoading(false);
