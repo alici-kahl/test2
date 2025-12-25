@@ -81,14 +81,13 @@ function formatSuggestion(row: any): string | null {
 }
 
 // --- Robust JSON fetch helper (fix: 504/HTML -> "not valid JSON") ---
-async function readJsonOrText(res: Response): Promise<{ ok: boolean; status: number; json?: any; text?: string }> {
+async function readJsonOrText(
+  res: Response
+): Promise<{ ok: boolean; status: number; json?: any; text?: string }> {
   const status = res.status;
   const ok = res.ok;
 
-  // Prefer text(), then parse JSON if possible (covers HTML error pages)
   const txt = await res.text();
-
-  // Try JSON parse if it looks like JSON
   const trimmed = txt.trim();
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
     try {
@@ -102,7 +101,8 @@ async function readJsonOrText(res: Response): Promise<{ ok: boolean; status: num
 }
 
 function explainHttp(status: number) {
-  if (status === 504) return "Server hat zu lange gebraucht (504 Gateway Timeout). Bitte erneut versuchen oder Suchraum/Iterationen reduzieren.";
+  if (status === 504)
+    return "Server hat zu lange gebraucht (504 Gateway Timeout). Bitte erneut versuchen oder Suchraum/Iterationen reduzieren.";
   if (status === 502) return "Server/Proxy-Fehler (502). Bitte erneut versuchen.";
   if (status === 500) return "Serverfehler (500).";
   if (status === 429) return "Zu viele Anfragen (429). Bitte kurz warten.";
@@ -181,14 +181,17 @@ function AutocompleteInput(props: {
           u.searchParams.set("viewbox", `${left},${top},${right},${bottom}`);
         }
         const r = await fetch(u.toString(), {
-          headers: { "User-Agent": "route-mvp/0.1 (demo)", "Accept-Language": "de" },
+          headers: {
+            "User-Agent": "route-mvp/0.1 (demo)",
+            "Accept-Language": "de",
+          },
           signal: aborter.signal,
         });
         const j = await r.json();
         if (reqIdRef.current !== myReqId) return;
 
         let list: Suggestion[] = Array.isArray(j)
-          ? (j
+          ? ((j
               .map((row: any) => {
                 const label = formatSuggestion(row);
                 if (!label) return null;
@@ -198,7 +201,7 @@ function AutocompleteInput(props: {
                   raw: row,
                 };
               })
-              .filter(Boolean) as Suggestion[])
+              .filter(Boolean) as unknown) as Suggestion[])
           : [];
 
         const ctr = info.center;
@@ -216,11 +219,19 @@ function AutocompleteInput(props: {
             const dist = ctr
               ? haversine(ctr.lat, ctr.lon, s.coord[1], s.coord[0])
               : Number.POSITIVE_INFINITY;
-            const rank = typeof s.raw?.place_rank === "number" ? s.raw.place_rank : 0;
-            const imp = typeof s.raw?.importance === "number" ? s.raw.importance : 0;
+            const rank =
+              typeof s.raw?.place_rank === "number" ? s.raw.place_rank : 0;
+            const imp =
+              typeof s.raw?.importance === "number" ? s.raw.importance : 0;
             return {
               s,
-              key: [inBox(s) ? 0 : 1, Math.round(dist), -rank, -imp, s.label.toLowerCase()],
+              key: [
+                inBox(s) ? 0 : 1,
+                Math.round(dist),
+                -rank,
+                -imp,
+                s.label.toLowerCase(),
+              ],
             };
           })
           .sort((a: any, b2: any) => {
@@ -299,10 +310,15 @@ function AutocompleteInput(props: {
             marginTop: 4,
             maxHeight: 280,
             overflow: "auto",
-            boxShadow: "0 8px 16px rgba(15,23,42,.08), 0 1px 2px rgba(15,23,42,.08)",
+            boxShadow:
+              "0 8px 16px rgba(15,23,42,.08), 0 1px 2px rgba(15,23,42,.08)",
           }}
         >
-          {loading && <div style={{ padding: 10, fontSize: 13, color: "#666" }}>Suche…</div>}
+          {loading && (
+            <div style={{ padding: 10, fontSize: 13, color: "#666" }}>
+              Suche…
+            </div>
+          )}
           {!loading &&
             items.map((it, i) => (
               <div
@@ -346,12 +362,24 @@ export default function Page() {
   const [usePlanner, setUsePlanner] = useState(true);
 
   // >>> Planner-Presets (starten mit DEFAULT_PLAN_PRESET)
-  const [corridorWidth, setCorridorWidth] = useState<number>(DEFAULT_PLAN_PRESET.corridor.width_m);
-  const [respectDir, setRespectDir] = useState<boolean>(DEFAULT_PLAN_PRESET.respect_direction);
-  const [rwBuffer, setRwBuffer] = useState<number>(DEFAULT_PLAN_PRESET.roadworks.buffer_m);
-  const [avoidTargetMax, setAvoidTargetMax] = useState<number>(DEFAULT_PLAN_PRESET.avoid_target_max);
-  const [valhallaSoftMax, setValhallaSoftMax] = useState<number>(DEFAULT_PLAN_PRESET.valhalla_soft_max);
-  const [alternates, setAlternates] = useState<number>(DEFAULT_PLAN_PRESET.alternates);
+  const [corridorWidth, setCorridorWidth] = useState<number>(
+    DEFAULT_PLAN_PRESET.corridor.width_m
+  );
+  const [respectDir, setRespectDir] = useState<boolean>(
+    DEFAULT_PLAN_PRESET.respect_direction
+  );
+  const [rwBuffer, setRwBuffer] = useState<number>(
+    DEFAULT_PLAN_PRESET.roadworks.buffer_m
+  );
+  const [avoidTargetMax, setAvoidTargetMax] = useState<number>(
+    DEFAULT_PLAN_PRESET.avoid_target_max
+  );
+  const [valhallaSoftMax, setValhallaSoftMax] = useState<number>(
+    DEFAULT_PLAN_PRESET.valhalla_soft_max
+  );
+  const [alternates, setAlternates] = useState<number>(
+    DEFAULT_PLAN_PRESET.alternates
+  );
 
   // Telemetrie vom Planer
   const [planMeta, setPlanMeta] = useState<null | {
@@ -393,11 +421,18 @@ export default function Page() {
   const [startCoord, setStartCoord] = useState<Coords | null>(null);
   const [endCoord, setEndCoord] = useState<Coords | null>(null);
 
+  // --- NEU: Trigger um setData “nachzuliefern”, falls die Style/Sources beim ersten Render noch nicht ready sind ---
+  const [renderTick, setRenderTick] = useState(0);
+
   // --- SAFE setData helper (verhindert setData-crash wenn Source noch nicht da ist) ---
   const safeSetGeoJSONSource = (map: Map, sourceId: string, data: any) => {
-    if (!mapLoadedRef.current || !map.isStyleLoaded()) return false;
+    if (!mapLoadedRef.current) return false;
+    // map.isStyleLoaded() kann kurz nach load noch false sein -> dann lieber retry über renderTick
+    if (!map.isStyleLoaded()) return false;
+
     const src = map.getSource(sourceId) as maplibregl.GeoJSONSource | undefined;
     if (!src || typeof (src as any).setData !== "function") return false;
+
     (src as any).setData(data);
     return true;
   };
@@ -420,17 +455,30 @@ export default function Page() {
               "https://c.tile.openstreetmap.org/{z}/{x}/{y}.png",
             ],
             tileSize: 256,
-            attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+            attribution:
+              '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
           },
-          "route-active": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
-          "route-alts": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
+          "route-active": {
+            type: "geojson",
+            data: { type: "FeatureCollection", features: [] },
+          },
+          "route-alts": {
+            type: "geojson",
+            data: { type: "FeatureCollection", features: [] },
+          },
           points: { type: "geojson", data: { type: "FeatureCollection", features: [] } },
 
           // Linien-Quelle
-          "roadworks-lines": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
+          "roadworks-lines": {
+            type: "geojson",
+            data: { type: "FeatureCollection", features: [] },
+          },
 
           // Ungeclusterte Icon-Quelle (für Sicht ab Zoom >= 11)
-          "roadworks-icons": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
+          "roadworks-icons": {
+            type: "geojson",
+            data: { type: "FeatureCollection", features: [] },
+          },
 
           // Geclusterte Spiegelquelle derselben Punkte (für Zoom <= 10)
           "roadworks-icons-cluster": {
@@ -463,7 +511,12 @@ export default function Page() {
             id: "route-alts-line",
             type: "line",
             source: "route-alts",
-            paint: { "line-color": "#666", "line-width": 5, "line-opacity": 0.9, "line-dasharray": [2, 2] },
+            paint: {
+              "line-color": "#666",
+              "line-width": 5,
+              "line-opacity": 0.9,
+              "line-dasharray": [2, 2],
+            },
             layout: { "line-join": "round", "line-cap": "round" },
           },
           {
@@ -592,8 +645,14 @@ export default function Page() {
         map.setLayoutProperty("roadworks-icon-fallback", "visibility", "visible");
       }
 
+      // --- Wichtig: einmal “nach-triggern”, damit Route/Points sicher gesetzt werden (falls Style gerade noch finalisiert) ---
+      setRenderTick((t) => t + 1);
+
       refreshRoadworks();
     });
+
+    // Falls die Style intern nochmal “nachlädt”, Route/Points erneut setzen
+    map.on("idle", () => setRenderTick((t) => t + 1));
 
     map.on("mouseenter", "route-alts-line", () => (map.getCanvas().style.cursor = "pointer"));
     map.on("mouseleave", "route-alts-line", () => (map.getCanvas().style.cursor = ""));
@@ -614,8 +673,8 @@ export default function Page() {
           typeof v === "number"
             ? v
             : typeof v === "string"
-              ? Number(v.replace(",", "."))
-              : NaN;
+            ? Number(v.replace(",", "."))
+            : NaN;
         return Number.isFinite(n) ? `${n.toFixed(digits)} ${unit}` : "unbekannt";
       };
 
@@ -699,11 +758,16 @@ export default function Page() {
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-    if (!mapLoadedRef.current || !map.isStyleLoaded()) return;
+
+    // Wenn Style/Sources noch nicht ready sind: kurz später erneut versuchen
+    if (!mapLoadedRef.current || !map.isStyleLoaded()) {
+      const t = window.setTimeout(() => setRenderTick((x) => x + 1), 80);
+      return () => window.clearTimeout(t);
+    }
 
     const emptyFC = { type: "FeatureCollection", features: [] as any[] };
 
-    // --- FIX: Start/Ziel-Punkte auch zeigen, wenn keine Route vorhanden (BLOCKED) ---
+    // Start/Ziel-Punkte immer setzen (auch wenn Route leer/blocked)
     const pts: any[] = [];
     if (startCoord)
       pts.push({
@@ -717,7 +781,12 @@ export default function Page() {
         geometry: { type: "Point", coordinates: endCoord },
         properties: { role: "end" },
       });
-    safeSetGeoJSONSource(map, "points", { type: "FeatureCollection", features: pts });
+
+    const okPts = safeSetGeoJSONSource(map, "points", { type: "FeatureCollection", features: pts });
+    if (!okPts) {
+      const t = window.setTimeout(() => setRenderTick((x) => x + 1), 80);
+      return () => window.clearTimeout(t);
+    }
 
     if (!geojson) {
       safeSetGeoJSONSource(map, "route-active", emptyFC);
@@ -727,24 +796,36 @@ export default function Page() {
       return;
     }
 
-    const features: any[] = geojson.features ?? [];
+    // --- Robust: akzeptiere FeatureCollection oder “Route-Array”
+    const features: any[] = Array.isArray(geojson?.features)
+      ? geojson.features
+      : Array.isArray(geojson)
+      ? geojson
+      : [];
+
     const active = features[activeIdx] ?? features[0];
     const alts = features
       .map((f: any, i: number) => ({ ...f, properties: { ...(f.properties || {}), idx: i } }))
       .filter((_: any, i: number) => i !== activeIdx);
 
-    safeSetGeoJSONSource(map, "route-active", {
+    const ok1 = safeSetGeoJSONSource(map, "route-active", {
       type: "FeatureCollection",
       features: active ? [active] : [],
     });
-    safeSetGeoJSONSource(map, "route-alts", {
+    const ok2 = safeSetGeoJSONSource(map, "route-alts", {
       type: "FeatureCollection",
       features: alts,
     });
 
+    if (!ok1 || !ok2) {
+      const t = window.setTimeout(() => setRenderTick((x) => x + 1), 80);
+      return () => window.clearTimeout(t);
+    }
+
+    // UI-Infos (optional – wenn API weniger Properties liefert, bleibt’s einfach leer)
     const maneuvers = active?.properties?.maneuvers ?? [];
-    setSteps(maneuvers);
-    setStreets(active?.properties?.streets_sequence ?? []);
+    setSteps(Array.isArray(maneuvers) ? maneuvers : []);
+    setStreets(Array.isArray(active?.properties?.streets_sequence) ? active.properties.streets_sequence : []);
 
     const bbox: [number, number, number, number] | undefined = active?.properties?.bbox;
     if (bbox) {
@@ -756,7 +837,8 @@ export default function Page() {
         { padding: { top: 40, right: 40, bottom: 40, left: 360 } }
       );
     }
-  }, [geojson, activeIdx, startCoord, endCoord]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [geojson, activeIdx, startCoord, endCoord, renderTick]);
 
   // -------------------- Roadworks fetch + draw --------------------
   async function refreshRoadworks() {
@@ -765,7 +847,12 @@ export default function Page() {
     if (!map || !mapLoadedRef.current || !map.isStyleLoaded()) return;
 
     const b = map.getBounds();
-    const bbox: [number, number, number, number] = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
+    const bbox: [number, number, number, number] = [
+      b.getWest(),
+      b.getSouth(),
+      b.getEast(),
+      b.getNorth(),
+    ];
 
     const local = new Date(whenIsoLocal);
     const ts = new Date(local.getTime() - local.getTimezoneOffset() * 60000).toISOString();
@@ -791,7 +878,11 @@ export default function Page() {
         .map((f: any) => {
           const p = f.properties || {};
           if (typeof p._icon_lon === "number" && typeof p._icon_lat === "number") {
-            return { type: "Feature", geometry: { type: "Point", coordinates: [p._icon_lon, p._icon_lat] }, properties: p };
+            return {
+              type: "Feature",
+              geometry: { type: "Point", coordinates: [p._icon_lon, p._icon_lat] },
+              properties: p,
+            };
           }
           const g = f.geometry;
           if (g?.type === "LineString" && Array.isArray(g.coordinates) && g.coordinates.length) {
@@ -895,7 +986,6 @@ export default function Page() {
 
         const parsed = await readJsonOrText(res);
         if (!parsed.ok) {
-          // FIX: Kein JSON => trotzdem saubere UI-Fehlermeldung statt Crash/alert
           const msg =
             parsed.json?.error ||
             (parsed.status ? explainHttp(parsed.status) : "Unbekannter Fehler") ||
@@ -924,16 +1014,15 @@ export default function Page() {
           limit_hit: m.limit_hit,
         });
 
-        // OPTION A: Route immer zeichnen, auch bei WARN (Best-Effort).
-        // Nur bei echtem BLOCKED (keine Route) leeren.
         if (data?.meta?.status === "BLOCKED") {
           setGeojson(null);
           setActiveIdx(0);
           setSteps([]);
           setStreets([]);
           setPlanBlocked({
-            // Deutsch + eindeutig
-            error: data?.meta?.error ? `Keine passende Umfahrung gefunden: ${data.meta.error}` : "Keine passende Umfahrung gefunden.",
+            error: data?.meta?.error
+              ? `Keine passende Umfahrung gefunden: ${data.meta.error}`
+              : "Keine passende Umfahrung gefunden.",
             warnings: Array.isArray(data?.blocking_warnings) ? data.blocking_warnings : [],
             meta: data?.meta ?? null,
           });
@@ -942,7 +1031,6 @@ export default function Page() {
 
           if (data?.meta?.status === "WARN") {
             setPlanBlocked({
-              // Deutsch + eindeutig
               error: data?.meta?.error
                 ? `Route gefunden, aber keine alternative Umfahrung gefunden: ${data.meta.error}`
                 : "Route gefunden, aber es gibt blockierende Stellen (Best-Effort).",
@@ -990,10 +1078,12 @@ export default function Page() {
       }
 
       setActiveIdx(0);
+      // Route/Points nach dem Setzen sicher nochmal “nach-triggern”
+      setRenderTick((t) => t + 1);
+
       mapRef.current?.resize();
       refreshRoadworks();
     } catch (e: any) {
-      // bleibt als letzter Schutz
       alert(String(e));
     } finally {
       setLoading(false);
