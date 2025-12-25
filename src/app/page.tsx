@@ -109,6 +109,46 @@ function explainHttp(status: number) {
   return `HTTP ${status}`;
 }
 
+// BBox aus LineString (fallback, wenn API kein bbox liefert)
+function bboxFromFeature(feature: any): [number, number, number, number] | null {
+  const g = feature?.geometry;
+  if (!g) return null;
+
+  const consume = (coords: any[]): [number, number, number, number] | null => {
+    if (!Array.isArray(coords) || coords.length === 0) return null;
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+    for (const c of coords) {
+      if (!Array.isArray(c) || c.length < 2) continue;
+      const x = Number(c[0]);
+      const y = Number(c[1]);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+    if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY))
+      return null;
+    return [minX, minY, maxX, maxY];
+  };
+
+  if (g.type === "LineString") return consume(g.coordinates);
+  if (g.type === "MultiLineString") {
+    const all: any[] = [];
+    for (const part of g.coordinates || []) all.push(...part);
+    return consume(all);
+  }
+  return null;
+}
+
+function toNumberMaybe(v: any): number | null {
+  const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+  return Number.isFinite(n) ? n : null;
+}
+
 // -------------------- Autocomplete --------------------
 function AutocompleteInput(props: {
   value: string;
@@ -361,7 +401,7 @@ export default function Page() {
   // >>> Schalter: klassisch vs. Planer
   const [usePlanner, setUsePlanner] = useState(true);
 
-  // >>> Planner-Presets (starten mit DEFAULT_PLAN_PRESET)
+  // >>> Planner-Presets
   const [corridorWidth, setCorridorWidth] = useState<number>(
     DEFAULT_PLAN_PRESET.corridor.width_m
   );
@@ -381,7 +421,6 @@ export default function Page() {
     DEFAULT_PLAN_PRESET.alternates
   );
 
-  // Telemetrie vom Planer
   const [planMeta, setPlanMeta] = useState<null | {
     after_merge?: number;
     cell_m?: number;
@@ -394,7 +433,6 @@ export default function Page() {
   const [rwLoading, setRwLoading] = useState(false);
   const [rwCount, setRwCount] = useState(0);
 
-  // >>> Blockade/Warn-Info aus /api/route/plan
   const [planBlocked, setPlanBlocked] = useState<null | {
     error?: string | null;
     warnings?: any[];
@@ -421,13 +459,12 @@ export default function Page() {
   const [startCoord, setStartCoord] = useState<Coords | null>(null);
   const [endCoord, setEndCoord] = useState<Coords | null>(null);
 
-  // --- NEU: Trigger um setData “nachzuliefern”, falls die Style/Sources beim ersten Render noch nicht ready sind ---
+  // --- Trigger um setData “nachzuliefern”, falls Style/Sources beim ersten Render noch nicht ready sind ---
   const [renderTick, setRenderTick] = useState(0);
 
-  // --- SAFE setData helper (verhindert setData-crash wenn Source noch nicht da ist) ---
+  // --- SAFE setData helper ---
   const safeSetGeoJSONSource = (map: Map, sourceId: string, data: any) => {
     if (!mapLoadedRef.current) return false;
-    // map.isStyleLoaded() kann kurz nach load noch false sein -> dann lieber retry über renderTick
     if (!map.isStyleLoaded()) return false;
 
     const src = map.getSource(sourceId) as maplibregl.GeoJSONSource | undefined;
@@ -466,21 +503,19 @@ export default function Page() {
             type: "geojson",
             data: { type: "FeatureCollection", features: [] },
           },
-          points: { type: "geojson", data: { type: "FeatureCollection", features: [] } },
+          points: {
+            type: "geojson",
+            data: { type: "FeatureCollection", features: [] },
+          },
 
-          // Linien-Quelle
           "roadworks-lines": {
             type: "geojson",
             data: { type: "FeatureCollection", features: [] },
           },
-
-          // Ungeclusterte Icon-Quelle (für Sicht ab Zoom >= 11)
           "roadworks-icons": {
             type: "geojson",
             data: { type: "FeatureCollection", features: [] },
           },
-
-          // Geclusterte Spiegelquelle derselben Punkte (für Zoom <= 10)
           "roadworks-icons-cluster": {
             type: "geojson",
             data: { type: "FeatureCollection", features: [] },
@@ -492,19 +527,19 @@ export default function Page() {
         layers: [
           { id: "osm", type: "raster", source: "osm" },
 
-          // Routen-Layer
+          // Route (DICK)
           {
             id: "route-active-casing",
             type: "line",
             source: "route-active",
-            paint: { "line-color": "#ffffff", "line-width": 9, "line-opacity": 0.9 },
+            paint: { "line-color": "#ffffff", "line-width": 12, "line-opacity": 0.95 },
             layout: { "line-join": "round", "line-cap": "round" },
           },
           {
             id: "route-active-line",
             type: "line",
             source: "route-active",
-            paint: { "line-color": "#1E90FF", "line-width": 6 },
+            paint: { "line-color": "#1E90FF", "line-width": 8, "line-opacity": 0.95 },
             layout: { "line-join": "round", "line-cap": "round" },
           },
           {
@@ -513,18 +548,20 @@ export default function Page() {
             source: "route-alts",
             paint: {
               "line-color": "#666",
-              "line-width": 5,
+              "line-width": 6,
               "line-opacity": 0.9,
               "line-dasharray": [2, 2],
             },
             layout: { "line-join": "round", "line-cap": "round" },
           },
+
+          // Punkte
           {
             id: "points-circle",
             type: "circle",
             source: "points",
             paint: {
-              "circle-radius": 6,
+              "circle-radius": 7,
               "circle-color": ["match", ["get", "role"], "start", "#00A651", "#D84A4A"],
               "circle-stroke-color": "#fff",
               "circle-stroke-width": 2,
@@ -547,7 +584,7 @@ export default function Page() {
             layout: { "line-join": "round", "line-cap": "round" },
           },
 
-          // --- Cluster bis Zoom 10 ---
+          // Cluster bis Zoom 10
           {
             id: "roadworks-clusters",
             type: "circle",
@@ -589,7 +626,7 @@ export default function Page() {
             paint: { "text-color": "#ffffff" },
           },
 
-          // --- Einzel-Icons ab Zoom 11 ---
+          // Einzel-Icons ab Zoom 11
           {
             id: "roadworks-icon",
             type: "symbol",
@@ -632,7 +669,7 @@ export default function Page() {
     map.on("load", async () => {
       mapLoadedRef.current = true;
 
-      // --- Icon laden ---
+      // Icon laden
       try {
         const res = await fetch("/roadwork.png", { cache: "no-cache" });
         if (!res.ok) throw new Error("HTTP " + res.status);
@@ -645,20 +682,20 @@ export default function Page() {
         map.setLayoutProperty("roadworks-icon-fallback", "visibility", "visible");
       }
 
-      // --- Wichtig: einmal “nach-triggern”, damit Route/Points sicher gesetzt werden (falls Style gerade noch finalisiert) ---
+      // Nach-triggern
       setRenderTick((t) => t + 1);
 
       refreshRoadworks();
     });
 
-    // Falls die Style intern nochmal “nachlädt”, Route/Points erneut setzen
     map.on("idle", () => setRenderTick((t) => t + 1));
 
     map.on("mouseenter", "route-alts-line", () => (map.getCanvas().style.cursor = "pointer"));
     map.on("mouseleave", "route-alts-line", () => (map.getCanvas().style.cursor = ""));
     map.on("click", "route-alts-line", (e: MapMouseEvent) => {
-      const idx = e.features?.[0]?.properties?.idx;
-      if (typeof idx === "number") setActiveIdx(idx);
+      const raw = e.features?.[0]?.properties?.idx;
+      const idxNum = toNumberMaybe(raw);
+      if (idxNum !== null) setActiveIdx(idxNum);
     });
 
     // Popups für Straßenarbeiten
@@ -725,7 +762,6 @@ export default function Page() {
       if (f) openRoadworkPopup(f);
     });
 
-    // Cluster: Zoom-in bei Klick
     map.on("click", "roadworks-clusters", (e) => {
       const feats = map.queryRenderedFeatures(e.point, { layers: ["roadworks-clusters"] });
       const clusterId = feats[0]?.properties?.cluster_id;
@@ -759,7 +795,6 @@ export default function Page() {
     const map = mapRef.current;
     if (!map) return;
 
-    // Wenn Style/Sources noch nicht ready sind: kurz später erneut versuchen
     if (!mapLoadedRef.current || !map.isStyleLoaded()) {
       const t = window.setTimeout(() => setRenderTick((x) => x + 1), 80);
       return () => window.clearTimeout(t);
@@ -767,7 +802,7 @@ export default function Page() {
 
     const emptyFC = { type: "FeatureCollection", features: [] as any[] };
 
-    // Start/Ziel-Punkte immer setzen (auch wenn Route leer/blocked)
+    // Punkte immer setzen
     const pts: any[] = [];
     if (startCoord)
       pts.push({
@@ -796,7 +831,7 @@ export default function Page() {
       return;
     }
 
-    // --- Robust: akzeptiere FeatureCollection oder “Route-Array”
+    // Robust: FeatureCollection oder Array
     const features: any[] = Array.isArray(geojson?.features)
       ? geojson.features
       : Array.isArray(geojson)
@@ -806,7 +841,7 @@ export default function Page() {
     const active = features[activeIdx] ?? features[0];
     const alts = features
       .map((f: any, i: number) => ({ ...f, properties: { ...(f.properties || {}), idx: i } }))
-      .filter((_: any, i: number) => i !== activeIdx);
+      .filter((_: any, i: number) => i !== (activeIdx ?? 0));
 
     const ok1 = safeSetGeoJSONSource(map, "route-active", {
       type: "FeatureCollection",
@@ -822,12 +857,15 @@ export default function Page() {
       return () => window.clearTimeout(t);
     }
 
-    // UI-Infos (optional – wenn API weniger Properties liefert, bleibt’s einfach leer)
+    // UI-Infos
     const maneuvers = active?.properties?.maneuvers ?? [];
     setSteps(Array.isArray(maneuvers) ? maneuvers : []);
     setStreets(Array.isArray(active?.properties?.streets_sequence) ? active.properties.streets_sequence : []);
 
-    const bbox: [number, number, number, number] | undefined = active?.properties?.bbox;
+    // FitBounds: erst API bbox, sonst berechnen
+    const bbox: [number, number, number, number] | null =
+      (active?.properties?.bbox as any) ?? bboxFromFeature(active);
+
     if (bbox) {
       map.fitBounds(
         [
@@ -837,6 +875,7 @@ export default function Page() {
         { padding: { top: 40, right: 40, bottom: 40, left: 360 } }
       );
     }
+
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [geojson, activeIdx, startCoord, endCoord, renderTick]);
 
@@ -954,7 +993,6 @@ export default function Page() {
       setStartCoord(start);
       setEndCoord(end);
 
-      // vor jedem Plan resetten
       setPlanBlocked(null);
 
       if (usePlanner) {
@@ -963,7 +1001,6 @@ export default function Page() {
           end,
           {
             corridor: { mode: "soft", width_m: corridorWidth },
-            // OPTION A: motorway-only AUS, sonst kaum Umfahrungen
             roadworks: { buffer_m: rwBuffer, only_motorways: false },
             avoid_target_max: avoidTargetMax,
             valhalla_soft_max: valhallaSoftMax,
@@ -1078,7 +1115,6 @@ export default function Page() {
       }
 
       setActiveIdx(0);
-      // Route/Points nach dem Setzen sicher nochmal “nach-triggern”
       setRenderTick((t) => t + 1);
 
       mapRef.current?.resize();
@@ -1139,7 +1175,6 @@ export default function Page() {
           Adresse <b>oder</b> „lon, lat“ eingeben. Alternativrouten sind anklickbar. Aktive Baustellen können als Layer eingeblendet werden.
         </p>
 
-        {/* WARN/BLOCKED Box */}
         {planBlocked && (
           <div
             style={{
