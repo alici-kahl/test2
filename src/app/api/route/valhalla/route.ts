@@ -169,7 +169,11 @@ export async function POST(req: NextRequest) {
     if (!vr.ok) {
       const text = await vr.text().catch(() => "");
       return NextResponse.json(
-        { error: text || "Valhalla Fehler", status: vr.status, geojson: { type: "FeatureCollection", features: [] } },
+        {
+          error: text || "Valhalla Fehler",
+          status: vr.status,
+          geojson: { type: "FeatureCollection", features: [] },
+        },
         { status: 200 }
       );
     }
@@ -185,7 +189,11 @@ export async function POST(req: NextRequest) {
   } catch (e: any) {
     clearTimeout(timeout);
     return NextResponse.json(
-      { error: String(e), type: "FetchError", geojson: { type: "FeatureCollection", features: [] } },
+      {
+        error: String(e),
+        type: "FetchError",
+        geojson: { type: "FeatureCollection", features: [] },
+      },
       { status: 200 }
     );
   }
