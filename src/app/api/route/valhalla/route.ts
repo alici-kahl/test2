@@ -10,6 +10,7 @@ type VehicleSpec = {
   height_m?: number;
   weight_t?: number;
   axleload_t?: number;
+  hazmat?: boolean; // <-- WICHTIG: nicht erzwingen, sondern vom Client übernehmen
 };
 
 function decodePolyline6(str: string): [number, number][] {
@@ -55,6 +56,7 @@ function valhallaToGeoJSON(response: any) {
     const props: any = {
       leg_index: idx,
       summary: {
+        // Valhalla length ist i.d.R. km (mit units=kilometers)
         distance_km: Number(summary.length || 0),
         duration_s: Number(summary.time || 0),
       },
@@ -85,16 +87,17 @@ function buildValhallaRequest(
   } = {}
 ) {
   const costing = "truck";
-  const hasAvoids =
-    Array.isArray(options.avoid_polygons) && options.avoid_polygons.length > 0;
+  const hasAvoids = Array.isArray(options.avoid_polygons) && options.avoid_polygons.length > 0;
 
   const truckCosting: any = {
     width: v.width_m ?? 2.55,
     height: v.height_m ?? 4.0,
+
+    // Valhalla erwartet kg
     weight: (v.weight_t ?? 40) * 1000,
     axle_load: (v.axleload_t ?? 10) * 1000,
 
-    // Avoids: stark, aber routbar (kein "Atombomben"-Penalty)
+    // Nur wenn Avoids aktiv sind, erhöhen wir die „Strafen“, sonst normal routen lassen
     use_highways: hasAvoids ? 0.7 : 1.0,
     shortest: false,
 
@@ -102,8 +105,9 @@ function buildValhallaRequest(
     gate_penalty: hasAvoids ? 50_000 : 300,
     service_penalty: hasAvoids ? 50_000 : 0,
 
-    country_crossing_penalty: 0,
-    hazmat: true,
+    // WICHTIG: Hazmat NICHT erzwingen.
+    // Wenn hazmat=true, kann Valhalla sehr schnell „NO path“ liefern (dein Problem bei langen Strecken).
+    hazmat: Boolean(v.hazmat),
   };
 
   const json: any = {
@@ -154,7 +158,10 @@ export async function POST(req: NextRequest) {
   });
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25_000); // schneller failen, damit Plan-Route nicht 504t
+
+  // Für lange Strecken Valhalla etwas mehr Luft geben, aber trotzdem kontrolliert failen,
+  // damit Next.js API nicht 504t.
+  const timeout = setTimeout(() => controller.abort(), 30_000);
 
   try {
     const vr = await fetch(valhallaURL, {
@@ -165,7 +172,7 @@ export async function POST(req: NextRequest) {
     });
     clearTimeout(timeout);
 
-    // IMMER JSON zurückgeben (sonst knallt dein Frontend beim JSON.parse)
+    // IMMER JSON zurückgeben
     if (!vr.ok) {
       const text = await vr.text().catch(() => "");
       return NextResponse.json(
