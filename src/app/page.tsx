@@ -373,6 +373,11 @@ export default function Page() {
     return true;
   };
 
+  const emptyFC = { type: "FeatureCollection", features: [] as any[] };
+
+  // Robust: akzeptiere auch Tippfehler "geojosn" aus Backend
+  const pickGeojson = (data: any) => data?.geojson ?? data?.geojosn ?? data?.geoJson ?? null;
+
   // -------------------- Map init --------------------
   useEffect(() => {
     if (mapRef.current || !containerRef.current) return;
@@ -393,20 +398,20 @@ export default function Page() {
             tileSize: 256,
             attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
           },
-          "route-active": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
-          "route-alts": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
-          points: { type: "geojson", data: { type: "FeatureCollection", features: [] } },
+          "route-active": { type: "geojson", data: emptyFC },
+          "route-alts": { type: "geojson", data: emptyFC },
+          points: { type: "geojson", data: emptyFC },
 
           // Linien-Quelle
-          "roadworks-lines": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
+          "roadworks-lines": { type: "geojson", data: emptyFC },
 
           // Ungeclusterte Icon-Quelle (für Sicht ab Zoom >= 11)
-          "roadworks-icons": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
+          "roadworks-icons": { type: "geojson", data: emptyFC },
 
           // Geclusterte Spiegelquelle derselben Punkte (für Zoom <= 10)
           "roadworks-icons-cluster": {
             type: "geojson",
-            data: { type: "FeatureCollection", features: [] },
+            data: emptyFC,
             cluster: true,
             clusterMaxZoom: 10,
             clusterRadius: 50,
@@ -415,7 +420,7 @@ export default function Page() {
         layers: [
           { id: "osm", type: "raster", source: "osm" },
 
-          // Routen-Layer
+          // Routen-Layer (DICK mit Outline)
           {
             id: "route-active-casing",
             type: "line",
@@ -666,24 +671,44 @@ export default function Page() {
     };
   }, []);
 
+  // -------------------- Punkte immer zeichnen (auch ohne Route) --------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (!mapLoadedRef.current || !map.isStyleLoaded()) return;
+
+    const pts: any[] = [];
+    if (startCoord)
+      pts.push({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: startCoord },
+        properties: { role: "start" },
+      });
+    if (endCoord)
+      pts.push({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: endCoord },
+        properties: { role: "end" },
+      });
+
+    safeSetGeoJSONSource(map, "points", { type: "FeatureCollection", features: pts });
+  }, [startCoord, endCoord]);
+
   // -------------------- Route zeichnen --------------------
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
     if (!mapLoadedRef.current || !map.isStyleLoaded()) return;
 
-    const emptyFC = { type: "FeatureCollection", features: [] as any[] };
-
     if (!geojson) {
       safeSetGeoJSONSource(map, "route-active", emptyFC);
       safeSetGeoJSONSource(map, "route-alts", emptyFC);
-      safeSetGeoJSONSource(map, "points", emptyFC);
       setSteps([]);
       setStreets([]);
       return;
     }
 
-    const features: any[] = geojson.features ?? [];
+    const features: any[] = Array.isArray(geojson?.features) ? geojson.features : [];
     const active = features[activeIdx] ?? features[0];
     const alts = features
       .map((f: any, i: number) => ({ ...f, properties: { ...(f.properties || {}), idx: i } }))
@@ -702,24 +727,6 @@ export default function Page() {
     setSteps(maneuvers);
     setStreets(active?.properties?.streets_sequence ?? []);
 
-    const pts: any[] = [];
-    if (startCoord)
-      pts.push({
-        type: "Feature",
-        geometry: { type: "Point", coordinates: startCoord },
-        properties: { role: "start" },
-      });
-    if (endCoord)
-      pts.push({
-        type: "Feature",
-        geometry: { type: "Point", coordinates: endCoord },
-        properties: { role: "end" },
-      });
-    safeSetGeoJSONSource(map, "points", {
-      type: "FeatureCollection",
-      features: pts,
-    });
-
     const bbox: [number, number, number, number] | undefined = active?.properties?.bbox;
     if (bbox) {
       map.fitBounds(
@@ -730,7 +737,7 @@ export default function Page() {
         { padding: { top: 40, right: 40, bottom: 40, left: 360 } }
       );
     }
-  }, [geojson, activeIdx, startCoord, endCoord]);
+  }, [geojson, activeIdx]);
 
   // -------------------- Roadworks fetch + draw --------------------
   async function refreshRoadworks() {
@@ -883,8 +890,22 @@ export default function Page() {
           limit_hit: m.limit_hit,
         });
 
-        // OPTION A: Route immer zeichnen, auch bei WARN (Best-Effort).
-        // Nur bei echtem BLOCKED (keine Route) leeren.
+        // Wichtig: GeoJSON robust holen (geojson oder geojosn)
+        const gj = pickGeojson(data);
+        if (!gj) {
+          setGeojson(null);
+          setActiveIdx(0);
+          setSteps([]);
+          setStreets([]);
+          setPlanBlocked({
+            error: "Backend hat kein GeoJSON geliefert (erwartet: geojson/geojosn).",
+            warnings: Array.isArray(data?.blocking_warnings) ? data.blocking_warnings : [],
+            meta: data?.meta ?? null,
+          });
+          return;
+        }
+
+        // Route immer zeichnen, auch bei WARN (Best-Effort). Nur bei BLOCKED leeren.
         if (data?.meta?.status === "BLOCKED") {
           setGeojson(null);
           setActiveIdx(0);
@@ -896,7 +917,7 @@ export default function Page() {
             meta: data?.meta ?? null,
           });
         } else {
-          setGeojson(data.geojson);
+          setGeojson(gj);
 
           if (data?.meta?.status === "WARN") {
             setPlanBlocked({
@@ -927,8 +948,16 @@ export default function Page() {
           setPlanMeta(null);
           return;
         }
+
+        const gj = pickGeojson(data);
+        if (!gj) {
+          alert("Valhalla-Fehler: Kein GeoJSON geliefert (erwartet: geojson/geojosn).");
+          setPlanMeta(null);
+          return;
+        }
+
         setPlanMeta(null);
-        setGeojson(data.geojson);
+        setGeojson(gj);
         setPlanBlocked(null);
       }
 
