@@ -1,5 +1,3 @@
-/* src/app/api/route/plan/route.ts */
-
 import { NextRequest, NextResponse } from "next/server";
 import bboxFn from "@turf/bbox";
 import buffer from "@turf/buffer";
@@ -219,21 +217,27 @@ export async function POST(req: NextRequest) {
   const vWidth = body.vehicle?.width_m ?? 2.55;
   const vWeight = body.vehicle?.weight_t ?? 40;
 
-  // Vercel maxDuration=60 -> wir bleiben bewusst darunter (inkl. Roadworks/Valhalla)
-  const TIME_BUDGET_MS = 45_000;
+  // Vercel maxDuration=60 -> wir bleiben bewusst darunter
+  const TIME_BUDGET_MS = 55_000;
   const t0 = Date.now();
   const timeLeft = () => TIME_BUDGET_MS - (Date.now() - t0);
 
-  // Einzel-Timeouts (damit keine 504s entstehen)
-  const ROADWORKS_TIMEOUT_MS = 8_000;
-  const VALHALLA_TIMEOUT_MS = 12_000;
+  // Einzel-Timeouts (wichtig gegen "Timeout"/504)
+  const ROADWORKS_TIMEOUT_MS = 10_000;
+
+  // WICHTIG: Valhalla braucht bei langen Strecken oft deutlich mehr als 12s.
+  // Gleichzeitig müssen wir kontrolliert bleiben, daher 20s.
+  const VALHALLA_TIMEOUT_MS = 20_000;
 
   /**
    * BBox steuert primär: wie viele Roadworks wir "kennen" (für Avoids/Scoring/Warnungen).
-   * Für "weitere Umwege" erweitern wir den Suchraum stufenweise.
+   * Für „weit suchen“ erweitern wir weiter nach oben.
    */
-  const BBOX_STEPS_KM = [150, 300, 600, 1200];
-  const MAX_ITERATIONS_PER_STEP = 3; // entscheidend gegen Timeout
+  const BBOX_STEPS_KM = [150, 300, 600, 1200, 2400];
+
+  // Weniger Iterationen pro Step = weniger Risiko, dass du ins Budget/Timeout läufst.
+  const MAX_ITERATIONS_PER_STEP = 2;
+
   const ROUTE_BUFFER_KM = 0.02;
 
   const valhallaSoftMax = body.valhalla_soft_max ?? 300;
@@ -255,7 +259,7 @@ export async function POST(req: NextRequest) {
 
   // Phase 1: STRICT (Avoids bauen aus BLOCKING-Stellen)
   for (const bboxKm of BBOX_STEPS_KM) {
-    if (timeLeft() < 12_000) break;
+    if (timeLeft() < VALHALLA_TIMEOUT_MS + 4_000) break;
 
     const bbox = makeSafeBBox(start, end, bboxKm);
 
@@ -272,7 +276,7 @@ export async function POST(req: NextRequest) {
       ROADWORKS_TIMEOUT_MS
     );
 
-    // Cap: riesige Mengen killen Laufzeit. (reicht fürs Scoring/Avoids)
+    // Cap: riesige Mengen killen Laufzeit
     const obstacles: Feature<any>[] = (rw?.features ?? []).slice(0, 2500);
 
     let avoids: Feature<Polygon>[] = [];
@@ -281,7 +285,7 @@ export async function POST(req: NextRequest) {
     let stuckReason: string | null = null;
 
     while (iterations < MAX_ITERATIONS_PER_STEP) {
-      if (timeLeft() < VALHALLA_TIMEOUT_MS + 3_000) {
+      if (timeLeft() < VALHALLA_TIMEOUT_MS + 2_000) {
         stuckReason = "Zeitbudget erreicht (STRICT abgebrochen).";
         break;
       }
@@ -316,7 +320,7 @@ export async function POST(req: NextRequest) {
 
       best = pickBetterCandidate(best, cand);
 
-      // Wenn komplett sauber (keine Roadworks-Treffer und keine Blocking-Warnungen) -> sofort zurück
+      // Wenn komplett sauber -> sofort zurück
       if (roadworksHits === 0 && blockingWarnings.length === 0) {
         phases.push({
           phase: "STRICT",
@@ -328,7 +332,7 @@ export async function POST(req: NextRequest) {
 
         return NextResponse.json({
           meta: {
-            source: "route/plan-v20-least-roadworks",
+            source: "route/plan-v21-least-roadworks",
             status: "CLEAN",
             clean: true,
             error: null,
@@ -344,7 +348,7 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      // Avoids nur aus BLOCKING-Stellen ableiten (sonst "übervermeiden" wir alles)
+      // Avoids nur aus BLOCKING-Stellen ableiten
       const line = route.features[0];
       const routeBuffer = buffer(line as any, ROUTE_BUFFER_KM, { units: "kilometers" });
 
@@ -353,7 +357,7 @@ export async function POST(req: NextRequest) {
         if (!booleanIntersects(routeBuffer, obs)) continue;
 
         const limits = getLimits(obs.properties);
-        if (limits.width >= vWidth && limits.weight >= vWeight) continue; // nicht blocking
+        if (limits.width >= vWidth && limits.weight >= vWeight) continue;
 
         const id = stableObsId(obs);
         if (avoidIds.has(id)) continue;
@@ -386,7 +390,7 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  // Phase 2: FALLBACK – ohne Avoids routen und ebenfalls als Kandidat werten
+  // Phase 2: FALLBACK – ohne Avoids routen und als Kandidat werten
   if (timeLeft() >= VALHALLA_TIMEOUT_MS + 2_000) {
     const bboxKm = BBOX_STEPS_KM[BBOX_STEPS_KM.length - 1];
     const bbox = makeSafeBBox(start, end, bboxKm);
@@ -449,7 +453,7 @@ export async function POST(req: NextRequest) {
   if (!best?.route?.features?.length) {
     return NextResponse.json({
       meta: {
-        source: "route/plan-v20-least-roadworks",
+        source: "route/plan-v21-least-roadworks",
         status: "BLOCKED",
         clean: false,
         error: "Es konnte gar keine Route berechnet werden (auch nicht als Notlösung).",
@@ -473,7 +477,7 @@ export async function POST(req: NextRequest) {
 
   return NextResponse.json({
     meta: {
-      source: "route/plan-v20-least-roadworks",
+      source: "route/plan-v21-least-roadworks",
       status,
       clean: status === "CLEAN",
       error: errorMsg,
