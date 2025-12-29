@@ -84,10 +84,15 @@ function buildValhallaRequest(
     avoid_polygons?: any[];
     directions_language?: string;
     alternates?: number;
+    // NEU: Radius-Fallback (in Metern). Wenn gesetzt, routet Valhalla zu einem Punkt
+    // innerhalb dieses Radius (stabilisiert "No path could be found" bei Truck).
+    start_radius_m?: number;
+    end_radius_m?: number;
   } = {}
 ) {
   const costing = "truck";
-  const hasAvoids = Array.isArray(options.avoid_polygons) && options.avoid_polygons.length > 0;
+  const hasAvoids =
+    Array.isArray(options.avoid_polygons) && options.avoid_polygons.length > 0;
 
   const truckCosting: any = {
     width: v.width_m ?? 2.55,
@@ -110,8 +115,27 @@ function buildValhallaRequest(
     hazmat: Boolean(v.hazmat),
   };
 
+  // NEU: radius direkt in locations (Valhalla unterstützt radius pro Location)
+  const startLoc: any = { lon: start[0], lat: start[1], type: "break" };
+  if (
+    typeof options.start_radius_m === "number" &&
+    Number.isFinite(options.start_radius_m) &&
+    options.start_radius_m > 0
+  ) {
+    startLoc.radius = options.start_radius_m;
+  }
+
+  const endLoc: any = { lon: end[0], lat: end[1], type: "break" };
+  if (
+    typeof options.end_radius_m === "number" &&
+    Number.isFinite(options.end_radius_m) &&
+    options.end_radius_m > 0
+  ) {
+    endLoc.radius = options.end_radius_m;
+  }
+
   const json: any = {
-    locations: [{ lon: start[0], lat: start[1] }, { lon: end[0], lat: end[1] }],
+    locations: [startLoc, endLoc],
     costing,
     costing_options: { truck: truckCosting },
     directions_options: {
@@ -136,6 +160,13 @@ export async function POST(req: NextRequest) {
   const end: Coords = body.end ?? [8.68, 50.11];
   const vehicle: VehicleSpec = body.vehicle ?? {};
 
+  // NEU: Radius-Parameter (in Metern) aus dem Body
+  // Empfehlung für deinen Fall (Truck "No path"): end_radius_m = 300
+  const start_radius_m =
+    typeof body.start_radius_m === "number" ? body.start_radius_m : undefined;
+  const end_radius_m =
+    typeof body.end_radius_m === "number" ? body.end_radius_m : undefined;
+
   const geoms: any[] = [];
   const pushGeom = (x: any) => {
     if (!x) return;
@@ -155,6 +186,8 @@ export async function POST(req: NextRequest) {
     avoid_polygons: geoms,
     directions_language: body.directions_language || "de-DE",
     alternates: body.alternates,
+    start_radius_m,
+    end_radius_m,
   });
 
   const controller = new AbortController();
