@@ -250,6 +250,7 @@ export async function POST(req: NextRequest) {
     alternates: body.alternates ?? 2,
     directions_language: body.directions_language ?? "de-DE",
     respect_direction: body.respect_direction ?? true,
+    end_radius_m: 300,
   };
 
   const phases: any[] = [];
