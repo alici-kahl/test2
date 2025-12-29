@@ -387,7 +387,7 @@ export default function Page() {
       container: containerRef.current,
       style: {
         version: 8,
-        glyphs: "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
+        glyphs: glyphs: "https://api.maptiler.com/fonts/{fontstack}/{range}.pbf?key=XPozqv0ojmUVrGgyvUDE",
         sources: {
           osm: {
             type: "raster",
