@@ -382,6 +382,7 @@ export default function Page() {
   useEffect(() => {
     if (mapRef.current || !containerRef.current) return;
 
+    console.log("[MAP INIT] creating map", new Date().toISOString());
     const map = new maplibregl.Map({
       container: containerRef.current,
       style: {
