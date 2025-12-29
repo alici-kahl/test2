@@ -8,9 +8,6 @@ import { lineString, polygon, Feature, FeatureCollection, Polygon } from "@turf/
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-// WICHTIG: sicherstellen, dass das NICHT als Edge-Route läuft (Edge hat andere Limits/Verhalten)
-export const runtime = "nodejs";
-
 type Coords = [number, number];
 
 type PlanReq = {
@@ -214,46 +211,32 @@ export async function POST(req: NextRequest) {
   const start = body.start;
   const end = body.end;
 
-  // Minimal: Eingangscheck, damit wir nicht “leerlaufen”
-  if (!Array.isArray(start) || start.length !== 2 || !Array.isArray(end) || end.length !== 2) {
-    return NextResponse.json(
-      {
-        meta: {
-          source: "route/plan-v21-least-roadworks",
-          status: "BLOCKED",
-          clean: false,
-          error: "Ungültige Eingabe: start/end fehlen oder sind nicht [lon,lat].",
-        },
-        geojson: { type: "FeatureCollection", features: [] },
-        blocking_warnings: [],
-      },
-      { status: 400 }
-    );
-  }
-
   const ts = body.ts ?? new Date().toISOString();
   const tz = body.tz ?? "Europe/Berlin";
 
   const vWidth = body.vehicle?.width_m ?? 2.55;
   const vWeight = body.vehicle?.weight_t ?? 40;
 
-  // Vercel maxDuration=60 -> wir bleiben bewusst deutlich darunter
-  const TIME_BUDGET_MS = 50_000; // vorher 55s – das war bei dir zu knapp, Vercel overhead zählt mit
+  // Vercel maxDuration=60 -> wir bleiben bewusst darunter
+  const TIME_BUDGET_MS = 55_000;
   const t0 = Date.now();
   const timeLeft = () => TIME_BUDGET_MS - (Date.now() - t0);
 
   // Einzel-Timeouts (wichtig gegen "Timeout"/504)
-  const ROADWORKS_TIMEOUT_MS = 7_000; // vorher 10s
-  const VALHALLA_TIMEOUT_MS = 18_000; // vorher 20s
+  const ROADWORKS_TIMEOUT_MS = 10_000;
+
+  // WICHTIG: Valhalla braucht bei langen Strecken oft deutlich mehr als 12s.
+  // Gleichzeitig müssen wir kontrolliert bleiben, daher 20s.
+  const VALHALLA_TIMEOUT_MS = 20_000;
 
   /**
-   * BBox steuert primär: wie viele Roadworks wir "kennen".
-   * Minimaler Fix: weniger Steps => weniger Calls => weniger Timeout-Risiko.
+   * BBox steuert primär: wie viele Roadworks wir "kennen" (für Avoids/Scoring/Warnungen).
+   * Für „weit suchen“ erweitern wir weiter nach oben.
    */
-  const BBOX_STEPS_KM = [300, 600, 1200]; // vorher [150,300,600,1200,2400]
+  const BBOX_STEPS_KM = [150, 300, 600, 1200, 2400];
 
-  // Minimaler Fix: maximal 1 Iteration pro Step (vorher 2)
-  const MAX_ITERATIONS_PER_STEP = 1;
+  // Weniger Iterationen pro Step = weniger Risiko, dass du ins Budget/Timeout läufst.
+  const MAX_ITERATIONS_PER_STEP = 2;
 
   const ROUTE_BUFFER_KM = 0.02;
 
@@ -277,8 +260,7 @@ export async function POST(req: NextRequest) {
 
   // Phase 1: STRICT (Avoids bauen aus BLOCKING-Stellen)
   for (const bboxKm of BBOX_STEPS_KM) {
-    // Minimal: wenn kaum noch Budget da ist -> sofort mit dem besten, was wir haben, raus
-    if (timeLeft() < VALHALLA_TIMEOUT_MS + 3_000) break;
+    if (timeLeft() < VALHALLA_TIMEOUT_MS + 4_000) break;
 
     const bbox = makeSafeBBox(start, end, bboxKm);
 
@@ -295,8 +277,8 @@ export async function POST(req: NextRequest) {
       ROADWORKS_TIMEOUT_MS
     );
 
-    // Minimal: Cap runter, große Mengen killen Laufzeit
-    const obstacles: Feature<any>[] = (rw?.features ?? []).slice(0, 1200);
+    // Cap: riesige Mengen killen Laufzeit
+    const obstacles: Feature<any>[] = (rw?.features ?? []).slice(0, 2500);
 
     let avoids: Feature<Polygon>[] = [];
     const avoidIds = new Set<string>();
@@ -427,7 +409,7 @@ export async function POST(req: NextRequest) {
       ROADWORKS_TIMEOUT_MS
     );
 
-    const obstacles: Feature<any>[] = (rw?.features ?? []).slice(0, 1200);
+    const obstacles: Feature<any>[] = (rw?.features ?? []).slice(0, 2500);
 
     const fallbackRes = await callValhalla(origin, plannerReqBase, [], VALHALLA_TIMEOUT_MS);
     const fallbackRoute: FeatureCollection = fallbackRes?.geojson ?? { type: "FeatureCollection", features: [] };
