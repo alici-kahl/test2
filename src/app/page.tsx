@@ -384,9 +384,167 @@ export default function Page() {
 
     const map = new maplibregl.Map({
       container: containerRef.current,
-      
-      style: `https://api.maptiler.com/maps/streets-v2/style.json?key=XPozqv0ojmUVrGgyvUDE`,
-      
+      style: {
+        version: 8,
+        glyphs: "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
+        sources: {
+          osm: {
+            type: "raster",
+            tiles: [
+              "https://a.tile.openstreetmap.org/{z}/{x}/{y}.png",
+              "https://b.tile.openstreetmap.org/{z}/{x}/{y}.png",
+              "https://c.tile.openstreetmap.org/{z}/{x}/{y}.png",
+            ],
+            tileSize: 256,
+            attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+          },
+          "route-active": { type: "geojson", data: emptyFC },
+          "route-alts": { type: "geojson", data: emptyFC },
+          points: { type: "geojson", data: emptyFC },
+
+          // Linien-Quelle
+          "roadworks-lines": { type: "geojson", data: emptyFC },
+
+          // Ungeclusterte Icon-Quelle (für Sicht ab Zoom >= 11)
+          "roadworks-icons": { type: "geojson", data: emptyFC },
+
+          // Geclusterte Spiegelquelle derselben Punkte (für Zoom <= 10)
+          "roadworks-icons-cluster": {
+            type: "geojson",
+            data: emptyFC,
+            cluster: true,
+            clusterMaxZoom: 10,
+            clusterRadius: 50,
+          },
+        },
+        layers: [
+          { id: "osm", type: "raster", source: "osm" },
+
+          // Routen-Layer (DICK mit Outline)
+          {
+            id: "route-active-casing",
+            type: "line",
+            source: "route-active",
+            paint: { "line-color": "#ffffff", "line-width": 9, "line-opacity": 0.9 },
+            layout: { "line-join": "round", "line-cap": "round" },
+          },
+          {
+            id: "route-active-line",
+            type: "line",
+            source: "route-active",
+            paint: { "line-color": "#1E90FF", "line-width": 6 },
+            layout: { "line-join": "round", "line-cap": "round" },
+          },
+          {
+            id: "route-alts-line",
+            type: "line",
+            source: "route-alts",
+            paint: { "line-color": "#666", "line-width": 5, "line-opacity": 0.9, "line-dasharray": [2, 2] },
+            layout: { "line-join": "round", "line-cap": "round" },
+          },
+          {
+            id: "points-circle",
+            type: "circle",
+            source: "points",
+            paint: {
+              "circle-radius": 6,
+              "circle-color": ["match", ["get", "role"], "start", "#00A651", "#D84A4A"],
+              "circle-stroke-color": "#fff",
+              "circle-stroke-width": 2,
+            },
+          },
+
+          // Roadworks-Linien
+          {
+            id: "roadworks-line-casing",
+            type: "line",
+            source: "roadworks-lines",
+            paint: { "line-color": "#ffffff", "line-width": 7, "line-opacity": 0.9 },
+            layout: { "line-join": "round", "line-cap": "round" },
+          },
+          {
+            id: "roadworks-line",
+            type: "line",
+            source: "roadworks-lines",
+            paint: { "line-color": "#E67E22", "line-width": 4 },
+            layout: { "line-join": "round", "line-cap": "round" },
+          },
+
+          // --- Cluster bis Zoom 10 ---
+          {
+            id: "roadworks-clusters",
+            type: "circle",
+            source: "roadworks-icons-cluster",
+            minzoom: 0,
+            maxzoom: 11,
+            filter: ["has", "point_count"],
+            paint: {
+              "circle-color": "#d28a3a",
+              "circle-opacity": 0.88,
+              "circle-stroke-color": "#7a4a15",
+              "circle-stroke-width": 1.2,
+              "circle-radius": [
+                "interpolate",
+                ["linear"],
+                ["zoom"],
+                3,
+                10,
+                6,
+                14,
+                9,
+                ["+", 10, ["*", 2, ["ln", ["+", 2, ["get", "point_count"]]]]],
+              ],
+            },
+          },
+          {
+            id: "roadworks-cluster-count",
+            type: "symbol",
+            source: "roadworks-icons-cluster",
+            minzoom: 0,
+            maxzoom: 11,
+            filter: ["has", "point_count"],
+            layout: {
+              "text-field": ["get", "point_count_abbreviated"],
+              "text-font": ["Open Sans Bold", "Arial Unicode MS Bold"],
+              "text-size": ["interpolate", ["linear"], ["zoom"], 3, 10, 9, 12],
+              "text-allow-overlap": true,
+            },
+            paint: { "text-color": "#ffffff" },
+          },
+
+          // --- Einzel-Icons ab Zoom 11 ---
+          {
+            id: "roadworks-icon",
+            type: "symbol",
+            source: "roadworks-icons",
+            minzoom: 11,
+            layout: {
+              "icon-image": "roadwork-24",
+              "icon-allow-overlap": false,
+              "icon-ignore-placement": false,
+              "icon-anchor": "center",
+              "icon-pitch-alignment": "viewport",
+              "icon-rotation-alignment": "viewport",
+              "icon-size": ["interpolate", ["linear"], ["zoom"], 11, 0.16, 13, 0.2, 15, 0.26, 17, 0.32],
+            },
+          },
+
+          // Fallback-Kreis falls PNG nicht lädt
+          {
+            id: "roadworks-icon-fallback",
+            type: "circle",
+            source: "roadworks-icons",
+            minzoom: 11,
+            layout: { visibility: "none" },
+            paint: {
+              "circle-radius": ["interpolate", ["linear"], ["zoom"], 11, 2.0, 17, 4.0],
+              "circle-color": "#E67E22",
+              "circle-stroke-width": 1.5,
+              "circle-stroke-color": "#ffffff",
+            },
+          },
+        ],
+      },
       center: [7.1, 51.1],
       zoom: 8.2,
     });
