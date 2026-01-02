@@ -286,7 +286,7 @@ export async function POST(req: NextRequest) {
             raw_http_status: vr.status,
             raw_status: parsed?.trip?.status ?? null,
             raw_status_message:
-              parsed?.trip?.status_message ?? rawText || "Valhalla Fehler",
+              ((parsed?.trip?.status_message ?? rawText) || "Valhalla Fehler"),
             has_trip: Boolean(parsed?.trip),
             has_alternates:
               Array.isArray(parsed?.alternates) && parsed.alternates.length > 0,
