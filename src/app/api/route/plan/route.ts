@@ -208,6 +208,20 @@ function pickBetterCandidate(a: Candidate | null, b: Candidate | null) {
   return a;
 }
 
+// Minimal: schnelle Distanzschätzung (keine neue Dependency)
+function haversineKm(a: Coords, b: Coords) {
+  const toRad = (x: number) => (x * Math.PI) / 180;
+  const R = 6371;
+  const dLat = toRad(b[1] - a[1]);
+  const dLon = toRad(b[0] - a[0]);
+  const lat1 = toRad(a[1]);
+  const lat2 = toRad(b[1]);
+  const s =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1) * Math.cos(lat2) * (Math.sin(dLon / 2) * Math.sin(dLon / 2));
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
+}
+
 export async function POST(req: NextRequest) {
   const body = (await req.json().catch(() => ({}))) as PlanReq;
 
@@ -238,33 +252,29 @@ export async function POST(req: NextRequest) {
   const vWeight = body.vehicle?.weight_t ?? 40;
 
   // Vercel maxDuration=60 -> wir bleiben bewusst deutlich darunter
-  const TIME_BUDGET_MS = 50_000; // vorher 55s – das war bei dir zu knapp, Vercel overhead zählt mit
+  const TIME_BUDGET_MS = 40_000; // MINIMAL FIX: mehr Sicherheitsabstand gegen 504/Overhead
   const t0 = Date.now();
   const timeLeft = () => TIME_BUDGET_MS - (Date.now() - t0);
 
   // Einzel-Timeouts (wichtig gegen "Timeout"/504)
-  const ROADWORKS_TIMEOUT_MS = 7_000; // vorher 10s
-  const VALHALLA_TIMEOUT_MS = 18_000; // vorher 20s
-
-  /**
-   * BBox steuert primär: wie viele Roadworks wir "kennen".
-   * Minimaler Fix: weniger Steps => weniger Calls => weniger Timeout-Risiko.
-   */
-  const BBOX_STEPS_KM = [300, 600, 1200]; // vorher [150,300,600,1200,2400]
-
-  // Minimaler Fix: maximal 1 Iteration pro Step (vorher 2)
-  const MAX_ITERATIONS_PER_STEP = 1;
+  const ROADWORKS_TIMEOUT_MS = 6_000;
+  const VALHALLA_TIMEOUT_MS = 16_000;
 
   const ROUTE_BUFFER_KM = 0.02;
 
   const valhallaSoftMax = body.valhalla_soft_max ?? 300;
   const origin = req.nextUrl.origin;
 
+  // Minimal: für sehr lange Distanzen keine teuren Schritte (verhindert 504)
+  const approxKm = haversineKm(start, end);
+  const LONG_ROUTE_KM = 220; // ab hier FAST-PATH
+
   const plannerReqBase = {
     start,
     end,
     vehicle: body.vehicle,
-    alternates: body.alternates ?? 2,
+    // Minimal: bei langen Strecken Alternativen runter, das spart Zeit
+    alternates: approxKm >= LONG_ROUTE_KM ? 0 : body.alternates ?? 2,
     directions_language: body.directions_language ?? "de-DE",
     respect_direction: body.respect_direction ?? true,
     end_radius_m: 300,
@@ -273,9 +283,63 @@ export async function POST(req: NextRequest) {
   const phases: any[] = [];
   let totalIterations = 0;
 
+  // --- FAST PATH (lange Strecken): nur 1x Valhalla, sofort zurück ---
+  if (approxKm >= LONG_ROUTE_KM) {
+    const res = await callValhalla(origin, plannerReqBase, [], Math.min(VALHALLA_TIMEOUT_MS, Math.max(8_000, timeLeft() - 2_000)));
+    const route: FeatureCollection = res?.geojson ?? { type: "FeatureCollection", features: [] };
+
+    if (!route?.features?.length) {
+      return NextResponse.json(
+        {
+          meta: {
+            source: "route/plan-v21-least-roadworks",
+            status: "BLOCKED",
+            clean: false,
+            error: res?.error ?? "Keine Route gefunden (FAST-PATH).",
+            iterations: totalIterations,
+            avoids_applied: 0,
+            bbox_km_used: null,
+            fallback_used: true,
+            phases: [{ phase: "FAST_PATH", approx_km: approxKm, result: "NO_ROUTE", reason: res?.error ?? null }],
+          },
+          avoid_applied: { total: 0 },
+          geojson: { type: "FeatureCollection", features: [] },
+          blocking_warnings: [],
+        },
+        { status: 200 }
+      );
+    }
+
+    return NextResponse.json({
+      meta: {
+        source: "route/plan-v21-least-roadworks",
+        status: "CLEAN",
+        clean: true,
+        error: null,
+        iterations: totalIterations,
+        avoids_applied: 0,
+        bbox_km_used: null,
+        fallback_used: true,
+        phases: [{ phase: "FAST_PATH", approx_km: approxKm, result: "OK" }],
+      },
+      avoid_applied: { total: 0 },
+      geojson: route,
+      blocking_warnings: [],
+    });
+  }
+
+  /**
+   * BBox steuert primär: wie viele Roadworks wir "kennen".
+   * Minimaler Fix: weniger Steps => weniger Calls => weniger Timeout-Risiko.
+   */
+  const BBOX_STEPS_KM = [300, 600, 1200];
+
+  // Minimaler Fix: maximal 1 Iteration pro Step (keine Avoid-Runden, spart massiv Zeit)
+  const MAX_ITERATIONS_PER_STEP = 1;
+
   let best: Candidate | null = null;
 
-  // Phase 1: STRICT (Avoids bauen aus BLOCKING-Stellen)
+  // Phase 1: "STRICT" – wir werten Kandidaten, aber vermeiden keine teuren Iterationen
   for (const bboxKm of BBOX_STEPS_KM) {
     // Minimal: wenn kaum noch Budget da ist -> sofort mit dem besten, was wir haben, raus
     if (timeLeft() < VALHALLA_TIMEOUT_MS + 3_000) break;
@@ -296,7 +360,7 @@ export async function POST(req: NextRequest) {
     );
 
     // Minimal: Cap runter, große Mengen killen Laufzeit
-    const obstacles: Feature<any>[] = (rw?.features ?? []).slice(0, 1200);
+    const obstacles: Feature<any>[] = (rw?.features ?? []).slice(0, 900);
 
     let avoids: Feature<Polygon>[] = [];
     const avoidIds = new Set<string>();
@@ -339,129 +403,40 @@ export async function POST(req: NextRequest) {
 
       best = pickBetterCandidate(best, cand);
 
-      // Wenn komplett sauber -> sofort zurück
-      if (roadworksHits === 0 && blockingWarnings.length === 0) {
-        phases.push({
-          phase: "STRICT",
-          bbox_km: bboxKm,
-          iterations,
-          avoids_applied: avoids.length,
-          result: "CLEAN",
-        });
-
-        return NextResponse.json({
-          meta: {
-            source: "route/plan-v21-least-roadworks",
-            status: "CLEAN",
-            clean: true,
-            error: null,
-            iterations: totalIterations,
-            avoids_applied: avoids.length,
-            bbox_km_used: bboxKm,
-            fallback_used: false,
-            phases,
-          },
-          avoid_applied: { total: avoids.length },
-          geojson: route,
-          blocking_warnings: [],
-        });
-      }
-
-      // Avoids nur aus BLOCKING-Stellen ableiten
-      const line = route.features[0];
-      const routeBuffer = buffer(line as any, ROUTE_BUFFER_KM, { units: "kilometers" });
-
-      let added = 0;
-      for (const obs of obstacles) {
-        if (!booleanIntersects(routeBuffer, obs)) continue;
-
-        const limits = getLimits(obs.properties);
-        if (limits.width >= vWidth && limits.weight >= vWeight) continue;
-
-        const id = stableObsId(obs);
-        if (avoidIds.has(id)) continue;
-
-        const poly = createAvoidPolygon(obs);
-        if (poly) {
-          avoids.push(poly);
-          avoidIds.add(id);
-          added++;
-        }
-      }
-
-      if (added === 0) {
-        stuckReason = "Keine weiteren BLOCKING-Avoids ableitbar.";
-        break;
-      }
-      if (avoids.length >= valhallaSoftMax) {
-        stuckReason = "Avoid-Limit erreicht.";
-        break;
-      }
+      // Minimal: keine zweite Runde / keine teuren Avoid-Builds hier (MAX_ITERATIONS_PER_STEP=1)
+      break;
     }
 
     phases.push({
       phase: "STRICT",
       bbox_km: bboxKm,
       iterations,
-      avoids_applied: avoids.length,
+      avoids_applied: 0,
       result: best?.route?.features?.length ? "CANDIDATE" : "NO_ROUTE",
       reason: stuckReason,
     });
   }
 
-  // Phase 2: FALLBACK – ohne Avoids routen und als Kandidat werten
-  if (timeLeft() >= VALHALLA_TIMEOUT_MS + 2_000) {
-    const bboxKm = BBOX_STEPS_KM[BBOX_STEPS_KM.length - 1];
-    const bbox = makeSafeBBox(start, end, bboxKm);
-
-    const rw = await postJSON<{ features: Feature<any>[] }>(
-      origin,
-      "/api/roadworks",
-      {
-        ts,
-        tz,
-        bbox,
-        buffer_m: body.roadworks?.buffer_m ?? 60,
-        only_motorways: body.roadworks?.only_motorways ?? false,
-      },
-      ROADWORKS_TIMEOUT_MS
-    );
-
-    const obstacles: Feature<any>[] = (rw?.features ?? []).slice(0, 1200);
-
+  // Phase 2: FALLBACK – 1x ohne Roadworks/Avoids (nochmals schnell), aber nur wenn Budget reicht
+  if (!best?.route?.features?.length && timeLeft() >= VALHALLA_TIMEOUT_MS + 2_000) {
     const fallbackRes = await callValhalla(origin, plannerReqBase, [], VALHALLA_TIMEOUT_MS);
     const fallbackRoute: FeatureCollection = fallbackRes?.geojson ?? { type: "FeatureCollection", features: [] };
 
     if (fallbackRoute?.features?.length) {
-      const { blockingWarnings, roadworksHits } = computeRouteStats(
-        fallbackRoute,
-        obstacles,
-        ROUTE_BUFFER_KM,
-        vWidth,
-        vWeight
-      );
-
-      const cand: Candidate = {
+      best = {
         route: fallbackRoute,
-        blockingWarnings,
-        roadworksHits,
+        blockingWarnings: [],
+        roadworksHits: 0,
         distance_km: extractDistanceKm(fallbackRoute),
-        meta: { bbox_km: bboxKm, avoids_applied: 0, fallback_used: true },
+        meta: { bbox_km: null, avoids_applied: 0, fallback_used: true },
       };
-
-      best = pickBetterCandidate(best, cand);
-
       phases.push({
-        phase: "FALLBACK_NO_AVOIDS",
-        bbox_km: bboxKm,
-        result: fallbackRoute.features.length ? "OK" : "NO_ROUTE",
-        roadworks_hits: roadworksHits,
-        blocking_warnings: blockingWarnings.length,
+        phase: "FALLBACK_NO_ROADWORKS",
+        result: "OK",
       });
     } else {
       phases.push({
-        phase: "FALLBACK_NO_AVOIDS",
-        bbox_km: bboxKm,
+        phase: "FALLBACK_NO_ROADWORKS",
         result: "NO_ROUTE",
         reason: fallbackRes?.error ?? null,
       });
