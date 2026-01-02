@@ -203,6 +203,102 @@ async function fetchValhallaJson(
   }
 }
 
+/**
+ * -------- NEU (minimal): Grober BBox-Filter für Avoid-Polygone ----------
+ * Idee: Bei langen Strecken kommen extrem viele Roadwork-Polygone rein.
+ * Valhalla wird dann langsam/unzuverlässig. Wir filtern grob auf den Bereich
+ * zwischen Start und Ziel (+Puffer), bevor wir MAX_AVOIDS anwenden.
+ */
+type BBox = { minLon: number; minLat: number; maxLon: number; maxLat: number };
+
+function clampNumber(n: any, fallback: number) {
+  const x = Number(n);
+  return Number.isFinite(x) ? x : fallback;
+}
+
+function expandBBox(b: BBox, bufferKm: number): BBox {
+  // sehr grobe Umrechnung: 1° lat ~ 111km
+  const dLat = bufferKm / 111;
+  // lon hängt von lat ab -> wir nehmen Mittelbreite als Approx
+  const midLat = (b.minLat + b.maxLat) / 2;
+  const cos = Math.max(0.2, Math.cos((midLat * Math.PI) / 180));
+  const dLon = bufferKm / (111 * cos);
+
+  return {
+    minLon: b.minLon - dLon,
+    minLat: b.minLat - dLat,
+    maxLon: b.maxLon + dLon,
+    maxLat: b.maxLat + dLat,
+  };
+}
+
+function bboxFromStartEnd(start: Coords, end: Coords): BBox {
+  return {
+    minLon: Math.min(start[0], end[0]),
+    minLat: Math.min(start[1], end[1]),
+    maxLon: Math.max(start[0], end[0]),
+    maxLat: Math.max(start[1], end[1]),
+  };
+}
+
+function geomBBox(geom: any): BBox | null {
+  // erwartet Polygon/MultiPolygon (oder ein GeoJSON-Objekt mit geometry)
+  const g = geom?.type ? geom : geom?.geometry;
+  if (!g?.type) return null;
+
+  const update = (lon: number, lat: number, acc: BBox) => {
+    if (lon < acc.minLon) acc.minLon = lon;
+    if (lat < acc.minLat) acc.minLat = lat;
+    if (lon > acc.maxLon) acc.maxLon = lon;
+    if (lat > acc.maxLat) acc.maxLat = lat;
+  };
+
+  try {
+    if (g.type === "Polygon") {
+      const acc: BBox = {
+        minLon: Infinity,
+        minLat: Infinity,
+        maxLon: -Infinity,
+        maxLat: -Infinity,
+      };
+      for (const ring of g.coordinates || []) {
+        for (const p of ring || []) update(p[0], p[1], acc);
+      }
+      if (!Number.isFinite(acc.minLon)) return null;
+      return acc;
+    }
+
+    if (g.type === "MultiPolygon") {
+      const acc: BBox = {
+        minLon: Infinity,
+        minLat: Infinity,
+        maxLon: -Infinity,
+        maxLat: -Infinity,
+      };
+      for (const poly of g.coordinates || []) {
+        for (const ring of poly || []) {
+          for (const p of ring || []) update(p[0], p[1], acc);
+        }
+      }
+      if (!Number.isFinite(acc.minLon)) return null;
+      return acc;
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function bboxIntersects(a: BBox, b: BBox) {
+  return !(
+    a.maxLon < b.minLon ||
+    a.minLon > b.maxLon ||
+    a.maxLat < b.minLat ||
+    a.minLat > b.maxLat
+  );
+}
+
 export async function POST(req: NextRequest) {
   const body = (await req.json().catch(() => ({}))) as any;
   const start: Coords = body.start ?? [6.96, 50.94];
@@ -250,8 +346,32 @@ export async function POST(req: NextRequest) {
       ? Math.floor(body.max_avoids)
       : 120;
 
-  const avoidAll = geoms;
-  const avoidReduced = geoms.length > MAX_AVOIDS ? geoms.slice(0, MAX_AVOIDS) : geoms;
+  // ------------------- NEU: Grober BBox-Filter -------------------
+  // Puffer ableiten: wenn Client corridor.width_m sendet, nutze das (sehr grob),
+  // sonst Standard-Puffer.
+  const corridorWidthM = clampNumber(body?.corridor?.width_m, 2000);
+  // 2km -> ~40km, gedeckelt (zu klein bringt nix, zu groß killt Performance)
+  const bufferKm = Math.max(25, Math.min(200, (corridorWidthM / 1000) * 20));
+
+  const corridorBBox = expandBBox(bboxFromStartEnd(start, end), bufferKm);
+
+  // Nur filtern, wenn es wirklich viele Polygone sind (sonst unnötig).
+  let avoidAll = geoms;
+  let avoidFiltered = geoms;
+  if (geoms.length > MAX_AVOIDS * 2) {
+    avoidFiltered = geoms.filter((g) => {
+      const bb = geomBBox(g);
+      if (!bb) return true; // wenn wir kein bbox berechnen können, lieber behalten
+      return bboxIntersects(bb, corridorBBox);
+    });
+
+    // Worst case: Filter war zu aggressiv -> dann doch alles nehmen
+    if (avoidFiltered.length === 0) avoidFiltered = geoms;
+    avoidAll = avoidFiltered;
+  }
+  // ---------------------------------------------------------------
+
+  const avoidReduced = avoidAll.length > MAX_AVOIDS ? avoidAll.slice(0, MAX_AVOIDS) : avoidAll;
 
   const baseOptions = {
     directions_language: body.directions_language || "de-DE",
@@ -281,6 +401,9 @@ export async function POST(req: NextRequest) {
   const meta: any = {
     source: "valhalla",
     avoid_requested: geoms.length, // was kam rein?
+    avoid_filtered: avoidFiltered.length, // NEU: nach grobem BBox-Filter
+    bbox_filter_used: geoms.length > MAX_AVOIDS * 2, // NEU
+    bbox_filter_buffer_km: bufferKm, // NEU
     avoid_applied: 0, // was wurde effektiv für den finalen Run genutzt?
     reduced_avoids: false,
     fallback_used: false,
