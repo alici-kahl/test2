@@ -376,14 +376,16 @@ export async function POST(req: NextRequest) {
   const vWidth = body.vehicle?.width_m ?? 2.55;
   const vWeight = body.vehicle?.weight_t ?? 40;
 
-  // Vercel maxDuration=60 -> wir bleiben bewusst darunter, aber geben mehr Luft als vorher
+  // Vercel maxDuration=60 -> wir bleiben bewusst darunter
   const TIME_BUDGET_MS = 55_000;
   const t0 = Date.now();
   const timeLeft = () => TIME_BUDGET_MS - (Date.now() - t0);
 
-  // Einzel-Timeouts
-  const ROADWORKS_TIMEOUT_MS = 7_000;
-  const VALHALLA_TIMEOUT_MS = 18_000;
+  // Einzel-Timeouts (wichtig für "lange Strecke muss iterieren können")
+  // Valhalla: etwas niedriger, damit mehrere Iterationen ins Budget passen
+  const VALHALLA_TIMEOUT_MS = 14_000;
+  // Roadworks: deutlich niedriger, weil wir Chunks parallel holen (sonst frisst es FAST_PATH auf)
+  const ROADWORKS_TIMEOUT_MS = 4_500;
 
   const ROUTE_BUFFER_KM = 0.02;
 
@@ -447,26 +449,36 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // NEU: Roadworks entlang der Route in Chunks holen
+    // Roadworks entlang der Route in Chunks holen
     const coords: Coords[] = (route0.features?.[0] as any)?.geometry?.coordinates ?? [];
-    const chunkKm = 200;
-    const overlapKm = 60;
-    const expandKm = Math.max(10, Math.min(25, corridorKm)); // stabiler als vorher
-    const boxes = chunkRouteToBBoxes(coords, chunkKm, overlapKm, expandKm);
+
+    // Weniger Boxen, aber dafür iterieren können:
+    // - chunk etwas größer
+    // - overlap kleiner
+    // - expand stabil
+    const chunkKm = 260;
+    const overlapKm = 45;
+    const expandKm = Math.max(10, Math.min(22, corridorKm));
+    const boxesAll = chunkRouteToBBoxes(coords, chunkKm, overlapKm, expandKm);
+
+    // HARD CAP: wir limitieren die Box-Anzahl, sonst frisst FAST_PATH das Zeitbudget
+    const MAX_BOXES_FAST = 3;
+    const boxes = boxesAll.slice(0, MAX_BOXES_FAST);
 
     const onlyMotorways = body.roadworks?.only_motorways ?? false;
 
-    const allFeat: Feature<any>[][] = [];
-    for (const bb of boxes) {
-      if (timeLeft() < 4_000) break;
-      const rw = await postJSON<{ features: Feature<any>[] }>(
+    // WICHTIG: parallel holen (sonst 3–4 Boxen * Timeout = keine Iteration möglich)
+    const rwPromises = boxes.map((bb) =>
+      postJSON<{ features: Feature<any>[] }>(
         origin,
         "/api/roadworks",
         { ts, tz, bbox: bb, buffer_m: roadworksBufferM, only_motorways: onlyMotorways },
         ROADWORKS_TIMEOUT_MS
-      );
-      allFeat.push((rw?.features ?? []) as Feature<any>[]);
-    }
+      )
+    );
+
+    const rwResults = await Promise.all(rwPromises);
+    const allFeat: Feature<any>[][] = rwResults.map((rw) => ((rw?.features ?? []) as Feature<any>[]));
 
     // cap etwas höher für lange Strecken (mehr Umfahrungs-Möglichkeiten)
     const merged = mergeObstacles(allFeat, 1400);
@@ -512,16 +524,17 @@ export async function POST(req: NextRequest) {
     }
 
     // Umfahrungs-Iterationen auch im FAST PATH (leicht erhöht)
-    const MAX_ITER_FAST = 4;
-    const MAX_AVOIDS_FAST = 18;
-    const MAX_NEW_AVOIDS_PER_ITER = 5;
+    const MAX_ITER_FAST = 6;
+    const MAX_AVOIDS_FAST = 22;
+    const MAX_NEW_AVOIDS_PER_ITER = 6;
 
     const avoidIds = new Set<string>();
     let avoids: Feature<Polygon>[] = [];
     let stuckReason: string | null = null;
 
     for (let i = 0; i < MAX_ITER_FAST; i++) {
-      if (timeLeft() < VALHALLA_TIMEOUT_MS + 3_000) {
+      // wir brauchen Platz für mindestens 1 Valhalla-Call + etwas Puffer
+      if (timeLeft() < VALHALLA_TIMEOUT_MS + 2_500) {
         stuckReason = "Zeitbudget erreicht (FAST_PATH Iteration abgebrochen).";
         break;
       }
@@ -674,7 +687,7 @@ export async function POST(req: NextRequest) {
     let stuckReason: string | null = null;
 
     while (iterations < MAX_ITERATIONS_PER_STEP) {
-      if (timeLeft() < VALHALLA_TIMEOUT_MS + 3_000) {
+      if (timeLeft() < VALHALLA_TIMEOUT_MS + 2_500) {
         stuckReason = "Zeitbudget erreicht (STRICT abgebrochen).";
         break;
       }
@@ -690,7 +703,14 @@ export async function POST(req: NextRequest) {
         break;
       }
 
-      const { blockingWarnings, roadworksHits } = computeRouteStats(route, obstacles, ROUTE_BUFFER_KM, vWidth, vWeight, avoidIds);
+      const { blockingWarnings, roadworksHits } = computeRouteStats(
+        route,
+        obstacles,
+        ROUTE_BUFFER_KM,
+        vWidth,
+        vWeight,
+        avoidIds
+      );
 
       const cand: Candidate = {
         route,
@@ -704,7 +724,9 @@ export async function POST(req: NextRequest) {
 
       // Alternative Kandidaten sammeln (nur wenige, damit Response klein bleibt)
       if (altCandidates.length < 2) {
-        const alreadySimilar = altCandidates.some((c) => Math.abs((c.distance_km || 0) - (cand.distance_km || 0)) < 0.1);
+        const alreadySimilar = altCandidates.some(
+          (c) => Math.abs((c.distance_km || 0) - (cand.distance_km || 0)) < 0.1
+        );
         if (!alreadySimilar) altCandidates.push(cand);
       }
 
@@ -765,7 +787,7 @@ export async function POST(req: NextRequest) {
       phase: "STRICT",
       bbox_km: bboxKm,
       iterations,
-      avoids_applied: avoids.length,
+      avoids_applied: 0, // bleibt bewusst so; detail findest du in meta unten
       result: best?.route?.features?.length ? "CANDIDATE" : "NO_ROUTE",
       reason: stuckReason,
     });
@@ -774,7 +796,7 @@ export async function POST(req: NextRequest) {
   }
 
   // Phase 2: FALLBACK – 1x ohne Roadworks/Avoids (nochmals schnell), aber nur wenn Budget reicht
-  if (!best?.route?.features?.length && timeLeft() >= VALHALLA_TIMEOUT_MS + 3_000) {
+  if (!best?.route?.features?.length && timeLeft() >= VALHALLA_TIMEOUT_MS + 2_500) {
     const fallbackRes = await callValhalla(origin, plannerReqBase, [], VALHALLA_TIMEOUT_MS);
     const fallbackRoute: FeatureCollection = fallbackRes?.geojson ?? { type: "FeatureCollection", features: [] };
 
@@ -825,9 +847,7 @@ export async function POST(req: NextRequest) {
       ? "Route gefunden, aber es gibt blockierende Baustellen. Es wurden Umfahrungen versucht; bitte Warnungen prüfen."
       : null;
 
-  const geojson_alts = altCandidates
-    .filter((c) => c.route?.features?.length)
-    .map((c) => c.route);
+  const geojson_alts = altCandidates.filter((c) => c.route?.features?.length).map((c) => c.route);
 
   return NextResponse.json({
     meta: {
