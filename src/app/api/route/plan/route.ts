@@ -517,7 +517,6 @@ export async function POST(req: NextRequest) {
       reason: stuckReason,
     });
 
-    // ✅ ÄNDERUNG: Strikte Prüfung FAST_PATH
     const status: "CLEAN" | "BLOCKED" = best.blockingWarnings.length ? "BLOCKED" : "CLEAN";
     const errorMsg =
       status === "BLOCKED"
@@ -545,8 +544,7 @@ export async function POST(req: NextRequest) {
 
   const BBOX_STEPS_KM = [300, 600, 1200];
 
-  // ✅ ÄNDERUNG 1: Iterations-Limit erhöht
-  const MAX_ITERATIONS_PER_STEP = 8; // war 4
+  const MAX_ITERATIONS_PER_STEP = 8;
   const MAX_AVOIDS_TOTAL = 12;
   const MAX_NEW_AVOIDS_PER_ITER = 4;
 
@@ -578,4 +576,201 @@ export async function POST(req: NextRequest) {
     const avoidIds = new Set<string>();
 
     let iterations = 0;
-    let stuckReason:
+    let stuckReason: string | null = null;
+
+    while (iterations < MAX_ITERATIONS_PER_STEP) {
+      if (timeLeft() < VALHALLA_TIMEOUT_MS + 2_000) {
+        stuckReason = "Zeitbudget erreicht (STRICT abgebrochen).";
+        break;
+      }
+
+      iterations++;
+      totalIterations++;
+
+      const res = await callValhalla(origin, plannerReqBase, avoids, VALHALLA_TIMEOUT_MS);
+      const route: FeatureCollection = res?.geojson ?? { type: "FeatureCollection", features: [] };
+
+      if (!route?.features?.length) {
+        stuckReason = res?.error ?? "Keine Route gefunden (Valhalla).";
+        break;
+      }
+
+      const { blockingWarnings, roadworksHits } = computeRouteStats(route, obstacles, ROUTE_BUFFER_KM, vWidth, vWeight, avoidIds);
+
+      const cand: Candidate = {
+        route,
+        blockingWarnings,
+        roadworksHits,
+        distance_km: extractDistanceKm(route),
+        meta: { bbox_km: bboxKm, avoids_applied: avoids.length, fallback_used: false },
+      };
+
+      best = pickBetterCandidate(best, cand);
+
+      if (altCandidates.length < 2) {
+        const alreadySimilar = altCandidates.some((c) => Math.abs((c.distance_km || 0) - (cand.distance_km || 0)) < 0.1);
+        if (!alreadySimilar) altCandidates.push(cand);
+      }
+
+      if (blockingWarnings.length === 0) {
+        stuckReason = null;
+        break;
+      }
+
+      const line = route.features[0];
+      let routeBufferPoly: any = null;
+      try {
+        routeBufferPoly = buffer(line as any, ROUTE_BUFFER_KM, { units: "kilometers" });
+      } catch {
+        routeBufferPoly = null;
+      }
+
+      const blockingObs: Feature<any>[] = [];
+      for (const obs of obstacles) {
+        if (routeBufferPoly && !booleanIntersects(routeBufferPoly as any, obs)) continue;
+        const limits = getLimits(obs.properties);
+        if (limits.width < vWidth || limits.weight < vWeight) {
+          const id = stableObsId(obs);
+          if (!avoidIds.has(id)) blockingObs.push(obs);
+        }
+      }
+
+      if (blockingObs.length === 0) {
+        stuckReason = "Blockierende Baustellen erkannt, aber keine neuen Avoid-Polygone ableitbar.";
+        break;
+      }
+
+      let added = 0;
+      for (const obs of blockingObs) {
+        if (avoids.length >= MAX_AVOIDS_TOTAL) break;
+
+        const id = stableObsId(obs);
+        if (avoidIds.has(id)) continue;
+
+        const poly = createAvoidPolygon(obs, avoidBufferKm);
+        if (!poly) continue;
+
+        avoids.push(poly);
+        avoidIds.add(id);
+        added++;
+
+        if (added >= MAX_NEW_AVOIDS_PER_ITER) break;
+      }
+
+      if (added === 0) {
+        stuckReason = "Konnte keine neuen Avoid-Polygone hinzufügen.";
+        break;
+      }
+    }
+
+    phases.push({
+      phase: "STRICT",
+      bbox_km: bboxKm,
+      iterations,
+      avoids_applied: avoids.length,
+      result: best?.route?.features?.length ? "CANDIDATE" : "NO_ROUTE",
+      reason: stuckReason,
+    });
+
+    if (best?.blockingWarnings?.length === 0) break;
+  }
+
+  if (!best?.route?.features?.length && timeLeft() >= VALHALLA_TIMEOUT_MS + 2_000) {
+    const fallbackRes = await callValhalla(origin, plannerReqBase, [], VALHALLA_TIMEOUT_MS);
+    const fallbackRoute: FeatureCollection = fallbackRes?.geojson ?? { type: "FeatureCollection", features: [] };
+
+    if (fallbackRoute?.features?.length) {
+      best = {
+        route: fallbackRoute,
+        blockingWarnings: [],
+        roadworksHits: 0,
+        distance_km: extractDistanceKm(fallbackRoute),
+        meta: { bbox_km: null, avoids_applied: 0, fallback_used: true },
+      };
+      phases.push({
+        phase: "FALLBACK_NO_ROADWORKS",
+        result: "OK",
+      });
+    } else {
+      phases.push({
+        phase: "FALLBACK_NO_ROADWORKS",
+        result: "NO_ROUTE",
+        reason: fallbackRes?.error ?? null,
+      });
+    }
+  }
+
+  if (!best?.route?.features?.length) {
+    return NextResponse.json({
+      meta: {
+        source: "route/plan-v21-least-roadworks",
+        status: "BLOCKED",
+        clean: false,
+        error: "Es konnte gar keine Route berechnet werden (auch nicht als Notlösung).",
+        iterations: totalIterations,
+        avoids_applied: 0,
+        bbox_km_used: null,
+        fallback_used: true,
+        phases,
+      },
+      avoid_applied: { total: 0 },
+      geojson: { type: "FeatureCollection", features: [] },
+      blocking_warnings: [],
+      geojson_alts: [],
+    });
+  }
+
+  if (best && best.blockingWarnings.length > 0) {
+    if (timeLeft() >= VALHALLA_TIMEOUT_MS + 2_000) {
+      const lastResortRes = await callValhalla(origin, plannerReqBase, [], VALHALLA_TIMEOUT_MS);
+      const lastResortRoute: FeatureCollection = lastResortRes?.geojson ?? { type: "FeatureCollection", features: [] };
+
+      if (lastResortRoute?.features?.length) {
+        const fallbackStats = computeRouteStats(lastResortRoute, [], ROUTE_BUFFER_KM, vWidth, vWeight);
+        if (fallbackStats.blockingWarnings.length === 0) {
+          best = {
+            route: lastResortRoute,
+            blockingWarnings: [],
+            roadworksHits: 0,
+            distance_km: extractDistanceKm(lastResortRoute),
+            meta: { bbox_km: null, avoids_applied: 0, fallback_used: true },
+          };
+          phases.push({ phase: "LAST_RESORT_FALLBACK", result: "CLEAN" });
+        }
+      }
+    }
+  }
+
+  const status: "CLEAN" | "BLOCKED" = 
+    best.blockingWarnings.length > 0 
+      ? "BLOCKED"
+      : "CLEAN";
+  
+  const errorMsg =
+    status === "BLOCKED"
+      ? "❌ KEINE DURCHFAHRBARE ROUTE GEFUNDEN. Alle Alternativen führen durch Baustellen, die für Ihr Fahrzeug zu eng/schwer sind. Bitte ändern Sie Start/Ziel oder Fahrzeugparameter."
+      : null;
+
+  const geojson_alts = altCandidates
+    .filter((c) => c.route?.features?.length)
+    .map((c) => c.route);
+
+  return NextResponse.json({
+    meta: {
+      source: "route/plan-v21-least-roadworks",
+      status,
+      clean: status === "CLEAN",
+      error: errorMsg,
+      iterations: totalIterations,
+      avoids_applied: best.meta.avoids_applied,
+      bbox_km_used: best.meta.bbox_km,
+      fallback_used: best.meta.fallback_used,
+      phases,
+    },
+    avoid_applied: { total: best.meta.avoids_applied },
+    geojson: best.route,
+    blocking_warnings: best.blockingWarnings,
+    geojson_al
+    ts,
+});
+}
