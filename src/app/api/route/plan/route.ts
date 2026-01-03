@@ -58,12 +58,15 @@ function stableObsId(obs: Feature<any>): string {
 }
 
 /**
- * Robust: BBox um die Baustelle (gepuffert).
- * bufferKm sollte ungefähr dem roadworks buffer entsprechen (z.B. 60m => 0.06km).
+ * Robust: Avoid-Polygon um eine Baustelle.
+ * Wichtig: buffer() kann bei kaputten/unerwarteten Geometrien werfen -> Fallback.
  */
 function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon> | null {
+  // Mindestpuffer: 30m (zu klein führt häufig dazu, dass Valhalla trotzdem “drüber schneidet”)
+  const km = Math.max(0.03, Number.isFinite(bufferKm) ? bufferKm : 0.03);
+
+  // 1) Primär: buffer() + bbox
   try {
-    const km = Math.max(0.02, Number.isFinite(bufferKm) ? bufferKm : 0.02); // mind. 20m
     const bf = buffer(f as any, km, { units: "kilometers" });
     const b = bboxFn(bf);
     return polygon([
@@ -76,13 +79,30 @@ function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon>
       ],
     ]);
   } catch {
-    return null;
+    // 2) Fallback: bbox vom Feature selbst + “expand”
+    try {
+      const b0 = bboxFn(f as any);
+      const expand = km * 1.5; // etwas großzügiger im Fallback
+      const b: [number, number, number, number] = [b0[0] - expand, b0[1] - expand, b0[2] + expand, b0[3] + expand];
+      return polygon([
+        [
+          [b[0], b[1]],
+          [b[2], b[1]],
+          [b[2], b[3]],
+          [b[0], b[3]],
+          [b[0], b[1]],
+        ],
+      ]);
+    } catch {
+      return null;
+    }
   }
 }
 
 async function callValhalla(origin: string, reqBody: any, avoidPolys: Feature<Polygon>[], timeoutMs: number) {
   const payload = {
     ...reqBody,
+    // Valhalla kann je nach Build avoid_polygons oder exclude_polygons nutzen.
     avoid_polygons: avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined,
     exclude_polygons: avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined,
   };
@@ -193,21 +213,17 @@ function pickBetterCandidate(a: Candidate | null, b: Candidate | null) {
   if (!a) return b;
   if (!b) return a;
 
-  // 0) CLEAN schlägt WARN (wichtig für "wirklich Umfahren")
   const aClean = a.blockingWarnings.length === 0;
   const bClean = b.blockingWarnings.length === 0;
   if (bClean && !aClean) return b;
   if (aClean && !bClean) return a;
 
-  // 1) Weniger BLOCKING-Problemstellen gewinnt (wichtiger als reine Trefferzahl)
   if (b.blockingWarnings.length < a.blockingWarnings.length) return b;
   if (b.blockingWarnings.length > a.blockingWarnings.length) return a;
 
-  // 2) Weniger Baustellen-Treffer gewinnt
   if (b.roadworksHits < a.roadworksHits) return b;
   if (b.roadworksHits > a.roadworksHits) return a;
 
-  // 3) Bei Gleichstand: kürzere Distanz gewinnt (falls bekannt)
   if (b.distance_km > 0 && a.distance_km > 0) {
     if (b.distance_km < a.distance_km) return b;
     if (b.distance_km > a.distance_km) return a;
@@ -216,7 +232,6 @@ function pickBetterCandidate(a: Candidate | null, b: Candidate | null) {
   return a;
 }
 
-// Minimal: schnelle Distanzschätzung (keine neue Dependency)
 function haversineKm(a: Coords, b: Coords) {
   const toRad = (x: number) => (x * Math.PI) / 180;
   const R = 6371;
@@ -230,10 +245,6 @@ function haversineKm(a: Coords, b: Coords) {
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
 }
 
-/**
- * NEU (minimal): lange Strecken => Roadworks entlang der Route in "Chunks" holen,
- * damit FAST_PATH nicht blind CLEAN zurückgibt.
- */
 function chunkRouteToBBoxes(coords: Coords[], chunkKm: number, overlapKm: number, expandKm: number) {
   if (!Array.isArray(coords) || coords.length < 2) return [] as [number, number, number, number][];
 
@@ -250,7 +261,6 @@ function chunkRouteToBBoxes(coords: Coords[], chunkKm: number, overlapKm: number
       const bb = bboxFn(buffer(ls, expandKm, { units: "kilometers" })) as [number, number, number, number];
       out.push(bb);
 
-      // overlap: gehe ein Stück zurück
       let back = 0;
       let j = i;
       while (j > 0 && back < overlapKm) {
@@ -262,7 +272,6 @@ function chunkRouteToBBoxes(coords: Coords[], chunkKm: number, overlapKm: number
     }
   }
 
-  // Tail
   const tail = coords.slice(startIdx);
   if (tail.length >= 2) {
     const ls = lineString(tail);
@@ -270,7 +279,6 @@ function chunkRouteToBBoxes(coords: Coords[], chunkKm: number, overlapKm: number
     out.push(bb);
   }
 
-  // Dedupe grob (damit wir nicht zu viele Requests machen)
   const seen = new Set<string>();
   return out.filter((b) => {
     const k = b.map((x) => x.toFixed(3)).join(",");
@@ -296,11 +304,6 @@ function mergeObstacles(featuresList: Feature<any>[][], cap: number) {
   return out;
 }
 
-/**
- * WICHTIG (Fix für "lange Umfahrungen"): wenn die Roadworks-Response sehr groß ist,
- * dürfen wir nicht blind "die ersten 900" nehmen.
- * Stattdessen: erst die Roadworks, die im (gepufferten) Korridor Start->End liegen, dann Rest.
- */
 function prioritizeObstacles(
   obstacles: Feature<any>[],
   start: Coords,
@@ -353,7 +356,6 @@ export async function POST(req: NextRequest) {
   const start = body.start;
   const end = body.end;
 
-  // Minimal: Eingangscheck, damit wir nicht “leerlaufen”
   if (!Array.isArray(start) || start.length !== 2 || !Array.isArray(end) || end.length !== 2) {
     return NextResponse.json(
       {
@@ -376,22 +378,19 @@ export async function POST(req: NextRequest) {
   const vWidth = body.vehicle?.width_m ?? 2.55;
   const vWeight = body.vehicle?.weight_t ?? 40;
 
-  // Vercel maxDuration=60 -> wir bleiben bewusst darunter
+  // Vercel maxDuration=60 -> wir bleiben darunter
   const TIME_BUDGET_MS = 55_000;
   const t0 = Date.now();
   const timeLeft = () => TIME_BUDGET_MS - (Date.now() - t0);
 
-  // Einzel-Timeouts (wichtig für "lange Strecke muss iterieren können")
-  // Valhalla: etwas niedriger, damit mehrere Iterationen ins Budget passen
   const VALHALLA_TIMEOUT_MS = 14_000;
-  // Roadworks: deutlich niedriger, weil wir Chunks parallel holen (sonst frisst es FAST_PATH auf)
   const ROADWORKS_TIMEOUT_MS = 4_500;
 
+  // Route-Buffer: 20m ist okay als Intersect-Test
   const ROUTE_BUFFER_KM = 0.02;
 
   const origin = req.nextUrl.origin;
 
-  // Distanz: lange Strecke = FAST-PATH (stabil), aber jetzt inkl. Roadworks/Umfahrung
   const approxKm = haversineKm(start, end);
   const LONG_ROUTE_KM = 220;
 
@@ -408,15 +407,20 @@ export async function POST(req: NextRequest) {
   const phases: any[] = [];
   let totalIterations = 0;
 
-  // Optional: roadworks buffer als Avoid-Puffer verwenden
   const roadworksBufferM = body.roadworks?.buffer_m ?? 60;
-  const avoidBufferKm = Math.max(0.02, roadworksBufferM / 1000); // mind. 20m
 
-  // für Roadworks-Priorisierung: Korridorbreite (km) grob aus corridor.width_m ableiten
+  // Avoid-Puffer: Basis aus Roadworks-Buffer + zusätzliche Sicherheitsmarge für sehr breite Fahrzeuge
+  const baseAvoidKm = Math.max(0.03, roadworksBufferM / 1000); // mind 30m
+  const widthExtraKm = Math.min(0.15, Math.max(0, (vWidth - 2.55) * 0.01)); // +1cm/km pro 1m über 2.55, capped
+  const avoidBufferKm = Math.max(baseAvoidKm, baseAvoidKm + widthExtraKm);
+
   const corridorWidthM = body.corridor?.width_m ?? 2000;
-  const corridorKm = Math.max(5, Math.min(35, (corridorWidthM / 1000) * 6));
+  const corridorKm = Math.max(6, Math.min(60, (corridorWidthM / 1000) * 6));
 
-  // --- FAST PATH (lange Strecken): 1) Route holen 2) Roadworks entlang Route 3) ggf. Umfahren ---
+  // dynamische Caps (optional steuerbar)
+  const MAX_AVOIDS_GLOBAL = Math.max(10, Math.min(80, body.avoid_target_max ?? 30));
+
+  // --- FAST PATH (lange Strecken) ---
   if (approxKm >= LONG_ROUTE_KM) {
     const res0 = await callValhalla(
       origin,
@@ -449,25 +453,20 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Roadworks entlang der Route in Chunks holen
     const coords: Coords[] = (route0.features?.[0] as any)?.geometry?.coordinates ?? [];
 
-    // Weniger Boxen, aber dafür iterieren können:
-    // - chunk etwas größer
-    // - overlap kleiner
-    // - expand stabil
     const chunkKm = 260;
     const overlapKm = 45;
-    const expandKm = Math.max(10, Math.min(22, corridorKm));
+    const expandKm = Math.max(10, Math.min(28, corridorKm)); // leicht größer für Detours in FAST_PATH
+
     const boxesAll = chunkRouteToBBoxes(coords, chunkKm, overlapKm, expandKm);
 
-    // HARD CAP: wir limitieren die Box-Anzahl, sonst frisst FAST_PATH das Zeitbudget
-    const MAX_BOXES_FAST = 3;
+    // Budget-sicher: max 4 Boxen
+    const MAX_BOXES_FAST = 4;
     const boxes = boxesAll.slice(0, MAX_BOXES_FAST);
 
     const onlyMotorways = body.roadworks?.only_motorways ?? false;
 
-    // WICHTIG: parallel holen (sonst 3–4 Boxen * Timeout = keine Iteration möglich)
     const rwPromises = boxes.map((bb) =>
       postJSON<{ features: Feature<any>[] }>(
         origin,
@@ -480,11 +479,9 @@ export async function POST(req: NextRequest) {
     const rwResults = await Promise.all(rwPromises);
     const allFeat: Feature<any>[][] = rwResults.map((rw) => ((rw?.features ?? []) as Feature<any>[]));
 
-    // cap etwas höher für lange Strecken (mehr Umfahrungs-Möglichkeiten)
-    const merged = mergeObstacles(allFeat, 1400);
-    const obstacles: Feature<any>[] = prioritizeObstacles(merged, start, end, corridorKm, 1200);
+    const merged = mergeObstacles(allFeat, 1800);
+    const obstacles: Feature<any>[] = prioritizeObstacles(merged, start, end, corridorKm, 1400);
 
-    // Erstprüfung auf Blocking
     const { blockingWarnings, roadworksHits } = computeRouteStats(route0, obstacles, ROUTE_BUFFER_KM, vWidth, vWeight);
 
     let best: Candidate = {
@@ -495,7 +492,6 @@ export async function POST(req: NextRequest) {
       meta: { bbox_km: null, avoids_applied: 0, fallback_used: true },
     };
 
-    // Wenn clean -> direkt zurück
     if (blockingWarnings.length === 0) {
       phases.push({
         phase: "FAST_PATH",
@@ -523,17 +519,15 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Umfahrungs-Iterationen auch im FAST PATH (leicht erhöht)
-    const MAX_ITER_FAST = 6;
-    const MAX_AVOIDS_FAST = 22;
-    const MAX_NEW_AVOIDS_PER_ITER = 6;
+    const MAX_ITER_FAST = 8;
+    const MAX_AVOIDS_FAST = Math.min(MAX_AVOIDS_GLOBAL, 50);
+    const MAX_NEW_AVOIDS_PER_ITER = 8;
 
     const avoidIds = new Set<string>();
     let avoids: Feature<Polygon>[] = [];
     let stuckReason: string | null = null;
 
     for (let i = 0; i < MAX_ITER_FAST; i++) {
-      // wir brauchen Platz für mindestens 1 Valhalla-Call + etwas Puffer
       if (timeLeft() < VALHALLA_TIMEOUT_MS + 2_500) {
         stuckReason = "Zeitbudget erreicht (FAST_PATH Iteration abgebrochen).";
         break;
@@ -541,7 +535,6 @@ export async function POST(req: NextRequest) {
 
       totalIterations++;
 
-      // Blockierende Obstacles sammeln (noch nicht avoided)
       const line = best.route.features[0];
       let routeBufferPoly: any = null;
       try {
@@ -565,6 +558,14 @@ export async function POST(req: NextRequest) {
         break;
       }
 
+      // Wichtig: engste (kritischste) zuerst
+      blockingObs.sort((a, b) => {
+        const la = getLimits(a.properties);
+        const lb = getLimits(b.properties);
+        if (la.width !== lb.width) return la.width - lb.width;
+        return la.weight - lb.weight;
+      });
+
       let added = 0;
       for (const obs of blockingObs) {
         if (avoids.length >= MAX_AVOIDS_FAST) break;
@@ -581,7 +582,7 @@ export async function POST(req: NextRequest) {
       }
 
       if (added === 0) {
-        stuckReason = "Konnte keine neuen Avoid-Polygone hinzufügen.";
+        stuckReason = "Konnte keine neuen Avoid-Polygone hinzufügen (Geometrie/Parsing).";
         break;
       }
 
@@ -645,17 +646,14 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  // BBox Steps (Roadworks Umfang) – erweitert, damit echte Umfahrungen wahrscheinlicher werden
+  // --- STRICT (kürzere Strecken) ---
   const BBOX_STEPS_KM = [200, 400, 800, 1400, 2200];
 
-  // Umfahrungen: mehrere Iterationen erlauben (aber gedeckelt)
-  const MAX_ITERATIONS_PER_STEP = 6;
-  const MAX_AVOIDS_TOTAL = 24;
-  const MAX_NEW_AVOIDS_PER_ITER = 5;
+  const MAX_ITERATIONS_PER_STEP = 7;
+  const MAX_AVOIDS_TOTAL = Math.min(MAX_AVOIDS_GLOBAL, 60);
+  const MAX_NEW_AVOIDS_PER_ITER = 7;
 
   let best: Candidate | null = null;
-
-  // Optional: 1–2 Alternativen sammeln (FeatureCollections)
   const altCandidates: Candidate[] = [];
 
   for (const bboxKm of BBOX_STEPS_KM) {
@@ -676,9 +674,12 @@ export async function POST(req: NextRequest) {
       ROADWORKS_TIMEOUT_MS
     );
 
-    // WICHTIG: nicht blind slice(0,900) – priorisieren statt verlieren
     const rawObstacles: Feature<any>[] = (rw?.features ?? []) as Feature<any>[];
-    const obstacles: Feature<any>[] = prioritizeObstacles(rawObstacles, start, end, corridorKm, 1200);
+
+    // Für große BBOX: Korridor etwas lockern, sonst werden Detour-Obstacles “wegpriorisiert”
+    const corridorKmStep = Math.min(90, Math.max(corridorKm, bboxKm * 0.04)); // z.B. bei 1400km => 56km
+
+    const obstacles: Feature<any>[] = prioritizeObstacles(rawObstacles, start, end, corridorKmStep, 1600);
 
     let avoids: Feature<Polygon>[] = [];
     const avoidIds = new Set<string>();
@@ -722,7 +723,6 @@ export async function POST(req: NextRequest) {
 
       best = pickBetterCandidate(best, cand);
 
-      // Alternative Kandidaten sammeln (nur wenige, damit Response klein bleibt)
       if (altCandidates.length < 2) {
         const alreadySimilar = altCandidates.some(
           (c) => Math.abs((c.distance_km || 0) - (cand.distance_km || 0)) < 0.1
@@ -730,13 +730,11 @@ export async function POST(req: NextRequest) {
         if (!alreadySimilar) altCandidates.push(cand);
       }
 
-      // CLEAN -> fertig
       if (blockingWarnings.length === 0) {
         stuckReason = null;
         break;
       }
 
-      // blockierend -> Avoids hinzufügen und neu routen
       const line = route.features[0];
       let routeBufferPoly: any = null;
       try {
@@ -760,6 +758,14 @@ export async function POST(req: NextRequest) {
         break;
       }
 
+      // Engste zuerst (schneller “CLEAN” erreichen)
+      blockingObs.sort((a, b) => {
+        const la = getLimits(a.properties);
+        const lb = getLimits(b.properties);
+        if (la.width !== lb.width) return la.width - lb.width;
+        return la.weight - lb.weight;
+      });
+
       let added = 0;
       for (const obs of blockingObs) {
         if (avoids.length >= MAX_AVOIDS_TOTAL) break;
@@ -778,7 +784,7 @@ export async function POST(req: NextRequest) {
       }
 
       if (added === 0) {
-        stuckReason = "Konnte keine neuen Avoid-Polygone hinzufügen.";
+        stuckReason = "Konnte keine neuen Avoid-Polygone hinzufügen (Geometrie/Parsing).";
         break;
       }
     }
@@ -787,7 +793,7 @@ export async function POST(req: NextRequest) {
       phase: "STRICT",
       bbox_km: bboxKm,
       iterations,
-      avoids_applied: 0, // bleibt bewusst so; detail findest du in meta unten
+      avoids_applied: best?.meta?.avoids_applied ?? 0,
       result: best?.route?.features?.length ? "CANDIDATE" : "NO_ROUTE",
       reason: stuckReason,
     });
@@ -795,7 +801,6 @@ export async function POST(req: NextRequest) {
     if (best?.blockingWarnings?.length === 0) break;
   }
 
-  // Phase 2: FALLBACK – 1x ohne Roadworks/Avoids (nochmals schnell), aber nur wenn Budget reicht
   if (!best?.route?.features?.length && timeLeft() >= VALHALLA_TIMEOUT_MS + 2_500) {
     const fallbackRes = await callValhalla(origin, plannerReqBase, [], VALHALLA_TIMEOUT_MS);
     const fallbackRoute: FeatureCollection = fallbackRes?.geojson ?? { type: "FeatureCollection", features: [] };
@@ -808,16 +813,9 @@ export async function POST(req: NextRequest) {
         distance_km: extractDistanceKm(fallbackRoute),
         meta: { bbox_km: null, avoids_applied: 0, fallback_used: true },
       };
-      phases.push({
-        phase: "FALLBACK_NO_ROADWORKS",
-        result: "OK",
-      });
+      phases.push({ phase: "FALLBACK_NO_ROADWORKS", result: "OK" });
     } else {
-      phases.push({
-        phase: "FALLBACK_NO_ROADWORKS",
-        result: "NO_ROUTE",
-        reason: fallbackRes?.error ?? null,
-      });
+      phases.push({ phase: "FALLBACK_NO_ROADWORKS", result: "NO_ROUTE", reason: fallbackRes?.error ?? null });
     }
   }
 
