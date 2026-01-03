@@ -196,7 +196,8 @@ function buildMeta(parsed: any, avoidCount: number) {
     raw_status_message: statusMessage,
     // Für Debug/Client-Logik hilfreich, ohne Struktur zu verändern
     has_trip: Boolean(trip),
-    has_alternates: Array.isArray(parsed?.alternates) && parsed.alternates.length > 0,
+    has_alternates:
+      Array.isArray(parsed?.alternates) && parsed.alternates.length > 0,
   };
 }
 
@@ -285,8 +286,11 @@ export async function POST(req: NextRequest) {
             avoid_count: geoms.length,
             raw_http_status: vr.status,
             raw_status: parsed?.trip?.status ?? null,
+
+            // FIX (Build-Fehler): keine Mischung aus ?? und ||; nur ?? verwenden.
             raw_status_message:
-              ((parsed?.trip?.status_message ?? rawText) || "Valhalla Fehler"),
+              parsed?.trip?.status_message ?? rawText ?? "Valhalla Fehler",
+
             has_trip: Boolean(parsed?.trip),
             has_alternates:
               Array.isArray(parsed?.alternates) && parsed.alternates.length > 0,
