@@ -767,11 +767,9 @@ export async function POST(req: NextRequest) {
       fallback_used: best.meta.fallback_used,
       phases,
     },
-    avoid_applied: {
-      total: best.meta.avoids_applied,
-    },
+    avoid_applied: { total: best.meta.avoids_applied },
     geojson: best.route,
     blocking_warnings: best.blockingWarnings,
-    geojson_al,
+    geojson_al
     ts,
-  });
+});
