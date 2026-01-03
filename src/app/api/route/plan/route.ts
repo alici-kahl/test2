@@ -772,5 +772,4 @@ export async function POST(req: NextRequest) {
     blocking_warnings: best.blockingWarnings,
     geojson_al
     ts,
-});
-}
+    });
