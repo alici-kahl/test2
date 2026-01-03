@@ -741,10 +741,7 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  const status: "CLEAN" | "BLOCKED" = 
-    best.blockingWarnings.length > 0 
-      ? "BLOCKED"
-      : "CLEAN";
+  const status: "CLEAN" | "BLOCKED" = best.blockingWarnings.length > 0 ? "BLOCKED" : "CLEAN";
   
   const errorMsg =
     status === "BLOCKED"
