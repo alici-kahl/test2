@@ -88,7 +88,7 @@ async function callValhalla(origin: string, reqBody: any, avoidPolys: Feature<Po
   };
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const res = await fetch(`${origin}/api/route/valhalla`, {
@@ -97,8 +97,6 @@ async function callValhalla(origin: string, reqBody: any, avoidPolys: Feature<Po
       body: JSON.stringify(payload),
       signal: controller.signal,
     });
-
-    clearTimeout(timeout);
 
     const text = await res.text().catch(() => "");
     try {
@@ -110,16 +108,17 @@ async function callValhalla(origin: string, reqBody: any, avoidPolys: Feature<Po
       };
     }
   } catch (e: any) {
-    clearTimeout(timeout);
     return { geojson: { type: "FeatureCollection", features: [] }, error: String(e) };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
 async function postJSON<T>(origin: string, path: string, body: any, timeoutMs: number): Promise<T | null> {
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
+  try {
     const r = await fetch(`${origin}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -127,12 +126,12 @@ async function postJSON<T>(origin: string, path: string, body: any, timeoutMs: n
       signal: controller.signal,
     });
 
-    clearTimeout(timeout);
     if (!r.ok) return null;
-
     return (await r.json()) as T;
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -297,6 +296,57 @@ function mergeObstacles(featuresList: Feature<any>[][], cap: number) {
   return out;
 }
 
+/**
+ * WICHTIG (Fix für "lange Umfahrungen"): wenn die Roadworks-Response sehr groß ist,
+ * dürfen wir nicht blind "die ersten 900" nehmen.
+ * Stattdessen: erst die Roadworks, die im (gepufferten) Korridor Start->End liegen, dann Rest.
+ */
+function prioritizeObstacles(
+  obstacles: Feature<any>[],
+  start: Coords,
+  end: Coords,
+  corridorKm: number,
+  cap: number
+) {
+  if (!Array.isArray(obstacles) || obstacles.length <= cap) return obstacles;
+
+  let corridorPoly: any = null;
+  try {
+    corridorPoly = buffer(lineString([start, end]), corridorKm, { units: "kilometers" });
+  } catch {
+    corridorPoly = null;
+  }
+
+  const primary: Feature<any>[] = [];
+  const secondary: Feature<any>[] = [];
+
+  for (const o of obstacles) {
+    if (corridorPoly && booleanIntersects(corridorPoly as any, o)) primary.push(o);
+    else secondary.push(o);
+  }
+
+  const out: Feature<any>[] = [];
+  const seen = new Set<string>();
+
+  const pushUnique = (f: Feature<any>) => {
+    const id = stableObsId(f);
+    if (seen.has(id)) return;
+    seen.add(id);
+    out.push(f);
+  };
+
+  for (const f of primary) {
+    pushUnique(f);
+    if (out.length >= cap) return out;
+  }
+  for (const f of secondary) {
+    pushUnique(f);
+    if (out.length >= cap) return out;
+  }
+
+  return out;
+}
+
 export async function POST(req: NextRequest) {
   const body = (await req.json().catch(() => ({}))) as PlanReq;
 
@@ -326,14 +376,14 @@ export async function POST(req: NextRequest) {
   const vWidth = body.vehicle?.width_m ?? 2.55;
   const vWeight = body.vehicle?.weight_t ?? 40;
 
-  // Vercel maxDuration=60 -> wir bleiben bewusst deutlich darunter
-  const TIME_BUDGET_MS = 40_000;
+  // Vercel maxDuration=60 -> wir bleiben bewusst darunter, aber geben mehr Luft als vorher
+  const TIME_BUDGET_MS = 55_000;
   const t0 = Date.now();
   const timeLeft = () => TIME_BUDGET_MS - (Date.now() - t0);
 
   // Einzel-Timeouts
-  const ROADWORKS_TIMEOUT_MS = 6_000;
-  const VALHALLA_TIMEOUT_MS = 16_000;
+  const ROADWORKS_TIMEOUT_MS = 7_000;
+  const VALHALLA_TIMEOUT_MS = 18_000;
 
   const ROUTE_BUFFER_KM = 0.02;
 
@@ -360,13 +410,17 @@ export async function POST(req: NextRequest) {
   const roadworksBufferM = body.roadworks?.buffer_m ?? 60;
   const avoidBufferKm = Math.max(0.02, roadworksBufferM / 1000); // mind. 20m
 
+  // für Roadworks-Priorisierung: Korridorbreite (km) grob aus corridor.width_m ableiten
+  const corridorWidthM = body.corridor?.width_m ?? 2000;
+  const corridorKm = Math.max(5, Math.min(35, (corridorWidthM / 1000) * 6));
+
   // --- FAST PATH (lange Strecken): 1) Route holen 2) Roadworks entlang Route 3) ggf. Umfahren ---
   if (approxKm >= LONG_ROUTE_KM) {
     const res0 = await callValhalla(
       origin,
       plannerReqBase,
       [],
-      Math.min(VALHALLA_TIMEOUT_MS, Math.max(8_000, timeLeft() - 2_000))
+      Math.min(VALHALLA_TIMEOUT_MS, Math.max(9_000, timeLeft() - 2_500))
     );
     const route0: FeatureCollection = res0?.geojson ?? { type: "FeatureCollection", features: [] };
 
@@ -395,16 +449,16 @@ export async function POST(req: NextRequest) {
 
     // NEU: Roadworks entlang der Route in Chunks holen
     const coords: Coords[] = (route0.features?.[0] as any)?.geometry?.coordinates ?? [];
-    const chunkKm = 220;
-    const overlapKm = 50;
-    const expandKm = Math.max(8, Math.min(20, ((body.corridor?.width_m ?? 2000) / 1000) * 6)); // grob, aber stabil
+    const chunkKm = 200;
+    const overlapKm = 60;
+    const expandKm = Math.max(10, Math.min(25, corridorKm)); // stabiler als vorher
     const boxes = chunkRouteToBBoxes(coords, chunkKm, overlapKm, expandKm);
 
     const onlyMotorways = body.roadworks?.only_motorways ?? false;
 
     const allFeat: Feature<any>[][] = [];
     for (const bb of boxes) {
-      if (timeLeft() < 3_000) break;
+      if (timeLeft() < 4_000) break;
       const rw = await postJSON<{ features: Feature<any>[] }>(
         origin,
         "/api/roadworks",
@@ -414,7 +468,9 @@ export async function POST(req: NextRequest) {
       allFeat.push((rw?.features ?? []) as Feature<any>[]);
     }
 
-    const obstacles: Feature<any>[] = mergeObstacles(allFeat, 900);
+    // cap etwas höher für lange Strecken (mehr Umfahrungs-Möglichkeiten)
+    const merged = mergeObstacles(allFeat, 1400);
+    const obstacles: Feature<any>[] = prioritizeObstacles(merged, start, end, corridorKm, 1200);
 
     // Erstprüfung auf Blocking
     const { blockingWarnings, roadworksHits } = computeRouteStats(route0, obstacles, ROUTE_BUFFER_KM, vWidth, vWeight);
@@ -429,7 +485,13 @@ export async function POST(req: NextRequest) {
 
     // Wenn clean -> direkt zurück
     if (blockingWarnings.length === 0) {
-      phases.push({ phase: "FAST_PATH", approx_km: approxKm, result: "OK", roadworks_hits: roadworksHits, boxes: boxes.length });
+      phases.push({
+        phase: "FAST_PATH",
+        approx_km: approxKm,
+        result: "OK",
+        roadworks_hits: roadworksHits,
+        boxes: boxes.length,
+      });
       return NextResponse.json({
         meta: {
           source: "route/plan-v21-least-roadworks",
@@ -449,17 +511,17 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // NEU: begrenzte Umfahrungs-Iterationen auch im FAST PATH
-    const MAX_ITER_FAST = 3;
-    const MAX_AVOIDS_FAST = 12;
-    const MAX_NEW_AVOIDS_PER_ITER = 4;
+    // Umfahrungs-Iterationen auch im FAST PATH (leicht erhöht)
+    const MAX_ITER_FAST = 4;
+    const MAX_AVOIDS_FAST = 18;
+    const MAX_NEW_AVOIDS_PER_ITER = 5;
 
     const avoidIds = new Set<string>();
     let avoids: Feature<Polygon>[] = [];
     let stuckReason: string | null = null;
 
     for (let i = 0; i < MAX_ITER_FAST; i++) {
-      if (timeLeft() < VALHALLA_TIMEOUT_MS + 2_000) {
+      if (timeLeft() < VALHALLA_TIMEOUT_MS + 3_000) {
         stuckReason = "Zeitbudget erreicht (FAST_PATH Iteration abgebrochen).";
         break;
       }
@@ -570,13 +632,13 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  // BBox Steps (Roadworks Umfang)
-  const BBOX_STEPS_KM = [300, 600, 1200];
+  // BBox Steps (Roadworks Umfang) – erweitert, damit echte Umfahrungen wahrscheinlicher werden
+  const BBOX_STEPS_KM = [200, 400, 800, 1400, 2200];
 
-  // ✅ Umfahrungen: mehrere Iterationen erlauben (aber gedeckelt)
-  const MAX_ITERATIONS_PER_STEP = 4;
-  const MAX_AVOIDS_TOTAL = 12;
-  const MAX_NEW_AVOIDS_PER_ITER = 4;
+  // Umfahrungen: mehrere Iterationen erlauben (aber gedeckelt)
+  const MAX_ITERATIONS_PER_STEP = 6;
+  const MAX_AVOIDS_TOTAL = 24;
+  const MAX_NEW_AVOIDS_PER_ITER = 5;
 
   let best: Candidate | null = null;
 
@@ -584,7 +646,7 @@ export async function POST(req: NextRequest) {
   const altCandidates: Candidate[] = [];
 
   for (const bboxKm of BBOX_STEPS_KM) {
-    if (timeLeft() < VALHALLA_TIMEOUT_MS + 3_000) break;
+    if (timeLeft() < VALHALLA_TIMEOUT_MS + 4_000) break;
 
     const bbox = makeSafeBBox(start, end, bboxKm);
 
@@ -601,7 +663,9 @@ export async function POST(req: NextRequest) {
       ROADWORKS_TIMEOUT_MS
     );
 
-    const obstacles: Feature<any>[] = (rw?.features ?? []).slice(0, 900);
+    // WICHTIG: nicht blind slice(0,900) – priorisieren statt verlieren
+    const rawObstacles: Feature<any>[] = (rw?.features ?? []) as Feature<any>[];
+    const obstacles: Feature<any>[] = prioritizeObstacles(rawObstacles, start, end, corridorKm, 1200);
 
     let avoids: Feature<Polygon>[] = [];
     const avoidIds = new Set<string>();
@@ -610,7 +674,7 @@ export async function POST(req: NextRequest) {
     let stuckReason: string | null = null;
 
     while (iterations < MAX_ITERATIONS_PER_STEP) {
-      if (timeLeft() < VALHALLA_TIMEOUT_MS + 2_000) {
+      if (timeLeft() < VALHALLA_TIMEOUT_MS + 3_000) {
         stuckReason = "Zeitbudget erreicht (STRICT abgebrochen).";
         break;
       }
@@ -644,13 +708,13 @@ export async function POST(req: NextRequest) {
         if (!alreadySimilar) altCandidates.push(cand);
       }
 
-      // ✅ CLEAN -> fertig
+      // CLEAN -> fertig
       if (blockingWarnings.length === 0) {
         stuckReason = null;
         break;
       }
 
-      // ✅ blockierend -> Avoids hinzufügen und neu routen
+      // blockierend -> Avoids hinzufügen und neu routen
       const line = route.features[0];
       let routeBufferPoly: any = null;
       try {
@@ -710,7 +774,7 @@ export async function POST(req: NextRequest) {
   }
 
   // Phase 2: FALLBACK – 1x ohne Roadworks/Avoids (nochmals schnell), aber nur wenn Budget reicht
-  if (!best?.route?.features?.length && timeLeft() >= VALHALLA_TIMEOUT_MS + 2_000) {
+  if (!best?.route?.features?.length && timeLeft() >= VALHALLA_TIMEOUT_MS + 3_000) {
     const fallbackRes = await callValhalla(origin, plannerReqBase, [], VALHALLA_TIMEOUT_MS);
     const fallbackRoute: FeatureCollection = fallbackRes?.geojson ?? { type: "FeatureCollection", features: [] };
 
