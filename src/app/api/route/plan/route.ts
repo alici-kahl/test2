@@ -756,20 +756,19 @@ export async function POST(req: NextRequest) {
     .map((c) => c.route);
 
   return NextResponse.json({
-    meta: {
-      source: "route/plan-v21-least-roadworks",
-      status,
-      clean: status === "CLEAN",
-      error: errorMsg,
-      iterations: totalIterations,
-      avoids_applied: best.meta.avoids_applied,
-      bbox_km_used: best.meta.bbox_km,
-      fallback_used: best.meta.fallback_used,
-      phases,
-    },
-    avoid_applied: { total: best.meta.avoids_applied },
-    geojson: best.route,
-    blocking_warnings: best.blockingWarnings,
-    geojson_al
-    ts,
+  meta: {
+    source: "route/plan-v21-least-roadworks",
+    status,
+    clean: status === "CLEAN",
+    error: errorMsg,
+    iterations: totalIterations,
+    avoids_applied: best.meta.avoids_applied,
+    bbox_km_used: best.meta.bbox_km,
+    fallback_used: best.meta.fallback_used,
+    phases,
+  },
+  avoid_applied: { total: best.meta.avoids_applied },
+  geojson: best.route,
+  blocking_warnings: best.blockingWarnings,
+  geojson_alts,
 });
