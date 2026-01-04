@@ -65,51 +65,72 @@ function stableObsId(obs: Feature<any>): string {
 
 /**
  * Robust: Avoid-Polygon um eine Baustelle.
- * Wichtig: buffer() kann bei kaputten/unerwarteten Geometrien werfen -> Fallback.
+ *
+ * ALT (Problem): turf.buffer(feature) kann bei "kaputten"/unerwarteten Geometrien werfen
+ * -> dann kommt "Konnte keine neuen Avoid-Polygone hinzufügen (Geometrie/Parsing)."
+ *
+ * NEU (Fix): Wir erzeugen IMMER ein Avoid-Rechteck rund um den centroid.
+ * Das kann praktisch nicht mehr scheitern und verhindert, dass die Iterationsschleife "stuck" geht.
  */
 function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon> | null {
-  // Mindestpuffer: 30m
   const km = Math.max(0.03, Number.isFinite(bufferKm) ? bufferKm : 0.03);
 
-  // 1) Primär: buffer() + bbox
+  let c: any;
   try {
-    const bf = buffer(f as any, km, { units: "kilometers" });
-    const b = bboxFn(bf);
-    return polygon([
-      [
-        [b[0], b[1]],
-        [b[2], b[1]],
-        [b[2], b[3]],
-        [b[0], b[3]],
-        [b[0], b[1]],
-      ],
-    ]);
+    c = centroid(f as any);
   } catch {
-    // 2) Fallback: bbox vom Feature selbst + expand
+    c = null;
+  }
+
+  let lon: number | null = null;
+  let lat: number | null = null;
+
+  try {
+    const coords = c?.geometry?.coordinates;
+    if (Array.isArray(coords) && coords.length === 2) {
+      lon = Number(coords[0]);
+      lat = Number(coords[1]);
+    }
+  } catch {
+    lon = null;
+    lat = null;
+  }
+
+  // Fallback: falls centroid irgendwie unbrauchbar ist, nimm bbox-mitte
+  if (lon === null || lat === null || !Number.isFinite(lon) || !Number.isFinite(lat)) {
     try {
-      const b0 = bboxFn(f as any);
-      const expand = km * 1.5;
-      const b: [number, number, number, number] = [b0[0] - expand, b0[1] - expand, b0[2] + expand, b0[3] + expand];
-      return polygon([
-        [
-          [b[0], b[1]],
-          [b[2], b[1]],
-          [b[2], b[3]],
-          [b[0], b[3]],
-          [b[0], b[1]],
-        ],
-      ]);
+      const b = bboxFn(f as any) as [number, number, number, number];
+      lon = (b[0] + b[2]) / 2;
+      lat = (b[1] + b[3]) / 2;
     } catch {
       return null;
     }
   }
+
+  // km -> Grad (grob, aber stabil und für Avoid ausreichend)
+  const latRad = (lat * Math.PI) / 180;
+  const dLat = km / 110.574; // km pro Breitengrad
+  const cosLat = Math.cos(latRad);
+  const dLon = km / (111.320 * (Math.abs(cosLat) < 1e-6 ? 1 : cosLat)); // km pro Längengrad
+
+  const b: [number, number, number, number] = [lon - dLon, lat - dLat, lon + dLon, lat + dLat];
+
+  return polygon([
+    [
+      [b[0], b[1]],
+      [b[2], b[1]],
+      [b[2], b[3]],
+      [b[0], b[3]],
+      [b[0], b[1]],
+    ],
+  ]);
 }
 
 /**
  * callValhalla:
  * - escape_mode an /api/route/valhalla weiterreichen
  * - alternates optional überschreiben
- * - avoid_polygons/exclude_polygons setzen
+ * - avoid_polygons setzen
  */
 async function callValhalla(
   origin: string,
@@ -123,8 +144,8 @@ async function callValhalla(
     ...reqBody,
     escape_mode: escape_mode || undefined,
     alternates: typeof alternates_override === "number" ? alternates_override : reqBody?.alternates,
+    // Wichtig: nur avoid_polygons verwenden (klarer, weniger "doppelte" Interpretation)
     avoid_polygons: avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined,
-    exclude_polygons: avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined,
   };
 
   const controller = new AbortController();
@@ -210,11 +231,18 @@ function computeRouteStats(
 
     const limits = getLimits(obs.properties);
     if (limits.width < vWidth || limits.weight < vWeight) {
+      let cc: any = null;
+      try {
+        cc = centroid(obs).geometry.coordinates;
+      } catch {
+        cc = null;
+      }
+
       blockingWarnings.push({
         title: obs.properties?.title,
         description: obs.properties?.description,
         limits,
-        coords: centroid(obs).geometry.coordinates,
+        coords: cc,
         already_avoided: avoidIds ? avoidIds.has(stableObsId(obs)) : false,
       });
     }
@@ -433,10 +461,10 @@ export async function POST(req: NextRequest) {
     /**
      * Timeouts pro Valhalla Call:
      * - initial moderat
-     * - eskaliert später (wenn require_clean und noch blockiert)
+     * - eskaliert später
      */
     const baseValhallaTimeout = vWidth >= 3 ? 12_000 : 14_000;
-    const maxValhallaTimeout = 18_000;
+    const maxValhallaTimeout = 19_000; // minimal erhöht, damit Eskalation real Wirkung hat
 
     const ROADWORKS_TIMEOUT_MS = 6_000;
     const ROUTE_BUFFER_KM = 0.02;
@@ -463,17 +491,17 @@ export async function POST(req: NextRequest) {
 
     // Avoid-Puffer: Roadworks-Buffer + Sicherheitsmarge für breite Fahrzeuge
     const baseAvoidKm = Math.max(0.03, roadworksBufferM / 1000);
-    const widthExtraKm = Math.min(0.20, Math.max(0, (vWidth - 2.55) * 0.012));
+    const widthExtraKm = Math.min(0.35, Math.max(0, (vWidth - 2.55) * 0.020)); // etwas aggressiver
     const avoidBufferKmBase = Math.max(baseAvoidKm, baseAvoidKm + widthExtraKm);
 
     const corridorWidthM = body.corridor?.width_m ?? 2000;
     const corridorKm = Math.max(6, Math.min(90, (corridorWidthM / 1000) * 6));
 
     // Mehr globales Avoid-Limit, aber gedeckelt (zu viele Polygone => Valhalla instabil)
-    const MAX_AVOIDS_GLOBAL = Math.max(20, Math.min(120, body.avoid_target_max ?? 60));
+    const MAX_AVOIDS_GLOBAL = Math.max(20, Math.min(140, body.avoid_target_max ?? 60));
 
     const IS_WIDE = vWidth >= 3;
-    const MAX_BLOCKING_SCAN = IS_WIDE ? 400 : 900;
+    const MAX_BLOCKING_SCAN = IS_WIDE ? 450 : 1000;
 
     const respondRequireCleanBlocked = (bestBlocking: any[], metaExtra: any) => {
       return NextResponse.json({
@@ -498,22 +526,21 @@ export async function POST(req: NextRequest) {
     };
 
     /**
-     * Eskalationsstrategie:
-     * - Stufe 0: escape_mode=true, alternates=3, normaler avoidBuffer
-     * - Stufe 1: alternates=5, Timeout hoch
-     * - Stufe 2: avoidBuffer etwas größer (hilft gegen "trotz Avoid drüber")
-     * - Stufe 3: alternates=7, Timeout max
+     * Eskalationsstrategie (härter):
+     * - Mehr Schritte
+     * - Größere BufferMul (sorgt dafür, dass Valhalla deutlich früher abbiegt)
+     * - Mehr Alternates
      */
     const ESCALATIONS = [
       { alternates: 3, timeout: baseValhallaTimeout, bufferMul: 1.0 },
-      { alternates: 5, timeout: Math.min(maxValhallaTimeout, baseValhallaTimeout + 3000), bufferMul: 1.0 },
-      { alternates: 5, timeout: Math.min(maxValhallaTimeout, baseValhallaTimeout + 4000), bufferMul: 1.35 },
-      { alternates: 7, timeout: maxValhallaTimeout, bufferMul: 1.35 },
+      { alternates: 5, timeout: Math.min(maxValhallaTimeout, baseValhallaTimeout + 3000), bufferMul: 1.15 },
+      { alternates: 7, timeout: Math.min(maxValhallaTimeout, baseValhallaTimeout + 4500), bufferMul: 1.45 },
+      { alternates: 9, timeout: maxValhallaTimeout, bufferMul: 1.85 },
+      { alternates: 11, timeout: maxValhallaTimeout, bufferMul: 2.25 },
     ];
 
     // --- FAST PATH (lange Strecken) ---
     if (approxKm >= LONG_ROUTE_KM) {
-      // Erstmal Grundroute ohne Avoids
       if (timeLeft() < baseValhallaTimeout + 4_000) {
         return NextResponse.json(
           {
@@ -565,7 +592,6 @@ export async function POST(req: NextRequest) {
 
       const coords: Coords[] = (route0.features?.[0] as any)?.geometry?.coordinates ?? [];
 
-      // Für lange Strecken: mehr Boxen als vorher, aber gedeckelt
       const chunkKm = 220;
       const overlapKm = 55;
       const expandKm = Math.max(12, Math.min(34, corridorKm));
@@ -628,16 +654,15 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      // Aggressiver als vorher:
-      const MAX_ITER_FAST = IS_WIDE ? 6 : 12;
-      const MAX_AVOIDS_FAST = Math.min(MAX_AVOIDS_GLOBAL, IS_WIDE ? 70 : 90);
-      const MAX_NEW_AVOIDS_PER_ITER = IS_WIDE ? 10 : 14;
+      // Aggressiver als vorher (aber noch im Zeitbudget machbar)
+      const MAX_ITER_FAST = IS_WIDE ? 8 : 16;
+      const MAX_AVOIDS_FAST = Math.min(MAX_AVOIDS_GLOBAL, IS_WIDE ? 90 : 120);
+      const MAX_NEW_AVOIDS_PER_ITER = IS_WIDE ? 14 : 20;
 
       const avoidIds = new Set<string>();
       let avoids: Feature<Polygon>[] = [];
       let stuckReason: string | null = null;
 
-      // Hauptschleife: adds avoid polygons + computes new route
       for (let i = 0; i < MAX_ITER_FAST; i++) {
         if (timeLeft() < baseValhallaTimeout + 3_500) {
           stuckReason = "Zeitbudget erreicht (FAST_PATH Iteration abgebrochen).";
@@ -672,7 +697,6 @@ export async function POST(req: NextRequest) {
           break;
         }
 
-        // Engste zuerst
         blockingObs.sort((a, b) => {
           const la = getLimits(a.properties);
           const lb = getLimits(b.properties);
@@ -686,7 +710,8 @@ export async function POST(req: NextRequest) {
           const id = stableObsId(obs);
           if (avoidIds.has(id)) continue;
 
-          const poly = createAvoidPolygon(obs, avoidBufferKmBase);
+          // leicht aggressiver, damit wir früher wegleiten
+          const poly = createAvoidPolygon(obs, avoidBufferKmBase * 1.15);
           if (!poly) continue;
 
           avoids.push(poly);
@@ -700,13 +725,12 @@ export async function POST(req: NextRequest) {
           break;
         }
 
-        // Mit Avoids -> escape_mode + alternates=3
-        const res = await callValhalla(origin, plannerReqBase, avoids, baseValhallaTimeout, true, 3);
+        // Mit Avoids -> escape_mode + mehr Alternates
+        const res = await callValhalla(origin, plannerReqBase, avoids, baseValhallaTimeout, true, 5);
         const route: FeatureCollection = res?.geojson ?? { type: "FeatureCollection", features: [] };
 
         if (!route?.features?.length) {
           stuckReason = res?.error ?? "Keine Route gefunden (Valhalla FAST_PATH Iteration).";
-          // Nicht sofort abbrechen: wir versuchen Eskalation unten (wenn Zeit)
           break;
         }
 
@@ -727,32 +751,33 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      // Eskalationspässe (nur wenn noch blockierend & noch Zeit)
+      // Eskalationspässe
       if (best.blockingWarnings.length > 0) {
         for (let e = 0; e < ESCALATIONS.length; e++) {
           const esc = ESCALATIONS[e];
           const needMs = esc.timeout + 3_500;
           if (timeLeft() < needMs) break;
 
-          // Optional: Buffer erhöhen (Stufe 2/3)
-          if (esc.bufferMul > 1.0) {
-            const bumped: Feature<Polygon>[] = [];
-            for (const obs of obstacles) {
-              // Nur die wirklich blockierenden
-              const limits = getLimits(obs.properties);
-              if (limits.width >= vWidth && limits.weight >= vWeight) continue;
-              const id = stableObsId(obs);
-              if (avoidIds.has(id)) continue;
+          // Buffer erhöhen -> zwingt Valhalla früher abzufahren
+          // Wichtig: Wir erzeugen zusätzliche Avoids um noch nicht "avoidete" Hindernisse
+          const bumped: Feature<Polygon>[] = [];
+          for (const obs of obstacles) {
+            const limits = getLimits(obs.properties);
+            if (limits.width >= vWidth && limits.weight >= vWeight) continue;
 
-              const poly = createAvoidPolygon(obs, avoidBufferKmBase * esc.bufferMul);
-              if (!poly) continue;
-              bumped.push(poly);
-              avoidIds.add(id);
-              if (avoids.length + bumped.length >= MAX_AVOIDS_FAST) break;
-              if (bumped.length >= (IS_WIDE ? 18 : 24)) break;
-            }
-            avoids = avoids.concat(bumped);
+            const id = stableObsId(obs);
+            if (avoidIds.has(id)) continue;
+
+            const poly = createAvoidPolygon(obs, avoidBufferKmBase * esc.bufferMul);
+            if (!poly) continue;
+
+            bumped.push(poly);
+            avoidIds.add(id);
+
+            if (avoids.length + bumped.length >= MAX_AVOIDS_FAST) break;
+            if (bumped.length >= (IS_WIDE ? 28 : 40)) break;
           }
+          avoids = avoids.concat(bumped);
 
           totalIterations++;
 
@@ -842,12 +867,11 @@ export async function POST(req: NextRequest) {
     }
 
     // --- STRICT (kürzere Strecken) ---
-    // Mehr Stufen + größere BBOXen => mehr Baustellen sehen => bessere Umfahrungschancen
     const BBOX_STEPS_KM = [200, 400, 800, 1400, 2200, 3200];
 
-    const MAX_ITERATIONS_PER_STEP = IS_WIDE ? 6 : 12;
-    const MAX_AVOIDS_TOTAL = Math.min(MAX_AVOIDS_GLOBAL, IS_WIDE ? 80 : 110);
-    const MAX_NEW_AVOIDS_PER_ITER = IS_WIDE ? 10 : 14;
+    const MAX_ITERATIONS_PER_STEP = IS_WIDE ? 8 : 16;
+    const MAX_AVOIDS_TOTAL = Math.min(MAX_AVOIDS_GLOBAL, IS_WIDE ? 110 : 140);
+    const MAX_NEW_AVOIDS_PER_ITER = IS_WIDE ? 14 : 20;
 
     let best: Candidate | null = null;
     const altCandidates: Candidate[] = [];
@@ -882,8 +906,7 @@ export async function POST(req: NextRequest) {
       let stuckReason: string | null = null;
 
       while (iterations < MAX_ITERATIONS_PER_STEP) {
-        // Je später, desto mehr Timeout geben
-        const localTimeout = Math.min(maxValhallaTimeout, baseValhallaTimeout + Math.min(5_000, iterations * 800));
+        const localTimeout = Math.min(maxValhallaTimeout, baseValhallaTimeout + Math.min(6_000, iterations * 900));
         if (timeLeft() < localTimeout + 3_500) {
           stuckReason = "Zeitbudget erreicht (STRICT abgebrochen).";
           break;
@@ -893,101 +916,95 @@ export async function POST(req: NextRequest) {
         totalIterations++;
 
         const escapeNow = avoids.length > 0;
-        const res = await callValhalla(origin, plannerReqBase, avoids, localTimeout, escapeNow, escapeNow ? 3 : undefined);
+        const res = await callValhalla(origin, plannerReqBase, avoids, localTimeout, escapeNow, escapeNow ? 5 : undefined);
 
         const route: FeatureCollection = res?.geojson ?? { type: "FeatureCollection", features: [] };
 
         if (!route?.features?.length) {
           stuckReason = res?.error ?? "Keine Route gefunden (Valhalla).";
-          // Weiter probieren lohnt nur, wenn wir neue Avoids hinzufügen können
-          // -> wir fallen unten durch und fügen Avoids hinzu
-        } else {
-          const { blockingWarnings, roadworksHits } = computeRouteStats(
-            route,
-            obstacles,
-            ROUTE_BUFFER_KM,
-            vWidth,
-            vWeight,
-            avoidIds
-          );
+          // In STRICT eskalieren wir innerhalb der Stufe: Buffer erhöhen und weiter versuchen (statt sofort abzubrechen)
+          // Wenn wir noch keine Avoids haben, ist ohne Route aber wenig zu tun -> nächster bboxKm Schritt kommt.
+          if (avoids.length === 0) break;
 
-          const cand: Candidate = {
-            route,
-            blockingWarnings,
-            roadworksHits,
-            distance_km: extractDistanceKm(route),
-            meta: { bbox_km: bboxKm, avoids_applied: avoids.length, fallback_used: false },
-          };
-
-          best = pickBetterCandidate(best, cand);
-
-          if (altCandidates.length < 3) {
-            const alreadySimilar = altCandidates.some((c) => Math.abs((c.distance_km || 0) - (cand.distance_km || 0)) < 0.1);
-            if (!alreadySimilar) altCandidates.push(cand);
-          }
-
-          if (blockingWarnings.length === 0) {
-            stuckReason = null;
-            break;
-          }
-
-          // Blocking obs aus aktueller Route ableiten und Avoids erweitern
-          const line = route.features[0];
-          let routeBufferPoly: any = null;
-          try {
-            routeBufferPoly = buffer(line as any, ROUTE_BUFFER_KM, { units: "kilometers" });
-          } catch {
-            routeBufferPoly = null;
-          }
-
-          const blockingObs: Feature<any>[] = [];
-          for (const obs of obstacles) {
-            if (routeBufferPoly && !booleanIntersects(routeBufferPoly as any, obs)) continue;
-            const limits = getLimits(obs.properties);
-            if (limits.width < vWidth || limits.weight < vWeight) {
-              const id = stableObsId(obs);
-              if (!avoidIds.has(id)) {
-                blockingObs.push(obs);
-                if (blockingObs.length >= MAX_BLOCKING_SCAN) break;
-              }
-            }
-          }
-
-          blockingObs.sort((a, b) => {
-            const la = getLimits(a.properties);
-            const lb = getLimits(b.properties);
-            if (la.width !== lb.width) return la.width - lb.width;
-            return la.weight - lb.weight;
-          });
-
-          let added = 0;
-          for (const obs of blockingObs) {
-            if (avoids.length >= MAX_AVOIDS_TOTAL) break;
-
-            const id = stableObsId(obs);
-            if (avoidIds.has(id)) continue;
-
-            const poly = createAvoidPolygon(obs, avoidBufferKmBase);
-            if (!poly) continue;
-
-            avoids.push(poly);
-            avoidIds.add(id);
-            added++;
-
-            if (added >= MAX_NEW_AVOIDS_PER_ITER) break;
-          }
-
-          if (added === 0) {
-            stuckReason = "Konnte keine neuen Avoid-Polygone hinzufügen (Geometrie/Parsing).";
-            break;
-          }
-
+          // Wenn Avoids existieren und wir keine Route bekommen, machen wir die Avoids NICHT größer,
+          // sondern versuchen es mit weniger Druck: etwas kleinere Subset (pop), um wieder eine Route zu bekommen.
+          avoids = avoids.slice(0, Math.max(0, avoids.length - (IS_WIDE ? 6 : 10)));
           continue;
         }
 
-        // Wenn keine Route kam: trotzdem versuchen, weitere Avoids aus "best" abzuleiten ist hier ohne Route schwierig.
-        // Minimal: wir brechen die Iteration nicht hart ab, sondern versuchen in der nächsten bboxKm Stufe weiter.
-        break;
+        const { blockingWarnings, roadworksHits } = computeRouteStats(route, obstacles, ROUTE_BUFFER_KM, vWidth, vWeight, avoidIds);
+
+        const cand: Candidate = {
+          route,
+          blockingWarnings,
+          roadworksHits,
+          distance_km: extractDistanceKm(route),
+          meta: { bbox_km: bboxKm, avoids_applied: avoids.length, fallback_used: false },
+        };
+
+        best = pickBetterCandidate(best, cand);
+
+        if (altCandidates.length < 3) {
+          const alreadySimilar = altCandidates.some((c) => Math.abs((c.distance_km || 0) - (cand.distance_km || 0)) < 0.1);
+          if (!alreadySimilar) altCandidates.push(cand);
+        }
+
+        if (blockingWarnings.length === 0) {
+          stuckReason = null;
+          break;
+        }
+
+        // Blocking obs aus aktueller Route ableiten und Avoids erweitern
+        const line = route.features[0];
+        let routeBufferPoly: any = null;
+        try {
+          routeBufferPoly = buffer(line as any, ROUTE_BUFFER_KM, { units: "kilometers" });
+        } catch {
+          routeBufferPoly = null;
+        }
+
+        const blockingObs: Feature<any>[] = [];
+        for (const obs of obstacles) {
+          if (routeBufferPoly && !booleanIntersects(routeBufferPoly as any, obs)) continue;
+          const limits = getLimits(obs.properties);
+          if (limits.width < vWidth || limits.weight < vWeight) {
+            const id = stableObsId(obs);
+            if (!avoidIds.has(id)) {
+              blockingObs.push(obs);
+              if (blockingObs.length >= MAX_BLOCKING_SCAN) break;
+            }
+          }
+        }
+
+        blockingObs.sort((a, b) => {
+          const la = getLimits(a.properties);
+          const lb = getLimits(b.properties);
+          if (la.width !== lb.width) return la.width - lb.width;
+          return la.weight - lb.weight;
+        });
+
+        let added = 0;
+        for (const obs of blockingObs) {
+          if (avoids.length >= MAX_AVOIDS_TOTAL) break;
+
+          const id = stableObsId(obs);
+          if (avoidIds.has(id)) continue;
+
+          // In STRICT ebenfalls leicht aggressiver: früher rauslenken
+          const poly = createAvoidPolygon(obs, avoidBufferKmBase * 1.25);
+          if (!poly) continue;
+
+          avoids.push(poly);
+          avoidIds.add(id);
+          added++;
+
+          if (added >= MAX_NEW_AVOIDS_PER_ITER) break;
+        }
+
+        if (added === 0) {
+          stuckReason = "Konnte keine neuen Avoid-Polygone hinzufügen (Geometrie/Parsing).";
+          break;
+        }
       }
 
       phases.push({
