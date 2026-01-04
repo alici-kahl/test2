@@ -42,7 +42,7 @@ function isMotorwayByProps(p: any): boolean {
 }
 
 /**
- * WICHTIG: Dieser Helper versucht, Breiten/Gewichte zu retten, 
+ * WICHTIG: Dieser Helper versucht, Breiten/Gewichte zu retten,
  * falls sie in der DB fehlen oder im Text versteckt sind.
  */
 function enrichFeatureProperties(f: any): any {
@@ -58,24 +58,22 @@ function enrichFeatureProperties(f: any): any {
 
   // 2. REGEX PARSING (Fallback, wenn Spalte leer)
   // Beispiel aus Log: "Verbot für Fahrzeuge über 2,10m"
-  if (!width || width > 900) { // 900 als Check falls Dummy-Werte drin sind
-      // Patterns: "Breite 3.5m", "max width 3,5m", "über 2,10m"
-      const widthMatch = 
-          text.match(/(?:Breite|width|breite)[^0-9]*([0-9]+(?:[.,][0-9]+)?)\s*m/i) || 
-          text.match(/([0-9]+(?:[.,][0-9]+)?)\s*m\s*(?:Breite|width|breite)/i) ||
-          text.match(/(?:über|over|width)\s*([0-9]+(?:[.,][0-9]+)?)\s*m/i);
+  if (!width || width > 900) {
+    const widthMatch =
+      text.match(/(?:Breite|width|breite)[^0-9]*([0-9]+(?:[.,][0-9]+)?)\s*m/i) ||
+      text.match(/([0-9]+(?:[.,][0-9]+)?)\s*m\s*(?:Breite|width|breite)/i) ||
+      text.match(/(?:über|over|width)\s*([0-9]+(?:[.,][0-9]+)?)\s*m/i);
 
-      if (widthMatch) {
-          // "2,10" -> 2.10
-          width = parseFloat(widthMatch[1].replace(",", "."));
-      }
+    if (widthMatch) {
+      width = parseFloat(widthMatch[1].replace(",", "."));
+    }
   }
 
   if (!weight || weight > 900) {
-      const weightMatch = text.match(/(?:Gewicht|weight|Last|last)[^0-9]*([0-9]+(?:[.,][0-9]+)?)\s*t/i);
-      if (weightMatch) {
-          weight = parseFloat(weightMatch[1].replace(",", "."));
-      }
+    const weightMatch = text.match(/(?:Gewicht|weight|Last|last)[^0-9]*([0-9]+(?:[.,][0-9]+)?)\s*t/i);
+    if (weightMatch) {
+      weight = parseFloat(weightMatch[1].replace(",", "."));
+    }
   }
 
   // 3. Werte standardisiert zurückschreiben, damit der PLANNER sie findet
@@ -97,7 +95,7 @@ export async function POST(req: Request) {
 
     if (!ts) {
       return NextResponse.json(
-        emptyFC({ ...metaBase, ts, tz, rw_bbox: bbox, only_motorways, error: "Missing 'ts' (ISO-UTC)" }),
+        emptyFC({ ...metaBase, ts, tz, rw_bbox: bbox, only_motorways, error: "Missing 'ts' (ISO-UTC)", rpc_ok: false }),
         { status: 400 }
       );
     }
@@ -107,12 +105,17 @@ export async function POST(req: Request) {
       process.env.SUPABASE_SERVICE_ROLE || process.env.SUPABASE_SERVICE_KEY;
 
     if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
-      return NextResponse.json(emptyFC({ error: "ENV missing" }), { status: 500 });
+      return NextResponse.json(emptyFC({ ...metaBase, error: "ENV missing", rpc_ok: false }), { status: 500 });
     }
 
     const rpcUrl = `${SUPABASE_URL}/rest/v1/rpc/get_active_roadworks_geojson`;
     const rpcPayload: Record<string, any> = { _ts: ts, _tz: tz };
     if (bbox) rpcPayload._bbox = bboxToWkt4326(bbox);
+
+    // ✅ MINIMAL: Timeout für RPC, damit lange BBoxes nicht “hängen”
+    const RPC_TIMEOUT_MS = 6_500;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), RPC_TIMEOUT_MS);
 
     const resp = await fetch(rpcUrl, {
       method: "POST",
@@ -125,13 +128,23 @@ export async function POST(req: Request) {
       },
       body: JSON.stringify(rpcPayload),
       cache: "no-store",
-    });
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timer));
 
     const text = await resp.text();
 
     if (!resp.ok) {
       return NextResponse.json(
-        emptyFC({ rpc_status: resp.status, error: "RPC failed" }),
+        emptyFC({
+          ...metaBase,
+          ts,
+          tz,
+          rw_bbox: bbox,
+          only_motorways,
+          rpc_ok: false,
+          rpc_status: resp.status,
+          error: "RPC failed",
+        }),
         { status: 200 }
       );
     }
@@ -140,7 +153,18 @@ export async function POST(req: Request) {
     try {
       parsed = text ? JSON.parse(text) : null;
     } catch {
-      return NextResponse.json(emptyFC({ error: "RPC JSON parse failed" }), { status: 200 });
+      return NextResponse.json(
+        emptyFC({
+          ...metaBase,
+          ts,
+          tz,
+          rw_bbox: bbox,
+          only_motorways,
+          rpc_ok: false,
+          error: "RPC JSON parse failed",
+        }),
+        { status: 200 }
+      );
     }
 
     let rawFeatures: any[] = [];
@@ -150,7 +174,6 @@ export async function POST(req: Request) {
       rawFeatures = parsed;
     }
 
-    // --- HIER IST DER FIX: ---
     // Wir laufen über alle Features und versuchen, die fehlenden Properties zu retten
     const enrichedFeatures = rawFeatures.map(enrichFeatureProperties);
 
@@ -169,6 +192,7 @@ export async function POST(req: Request) {
           tz,
           rw_bbox: bbox,
           only_motorways,
+          rpc_ok: true,
           fetched: rawFeatures.length,
           used: usedFeatures.length,
         },
@@ -176,6 +200,9 @@ export async function POST(req: Request) {
       { status: 200 }
     );
   } catch (e: any) {
-    return NextResponse.json(emptyFC({ ...metaBase, error: String(e?.message || e) }), { status: 200 });
+    return NextResponse.json(
+      emptyFC({ ...metaBase, rpc_ok: false, error: String(e?.message || e) }),
+      { status: 200 }
+    );
   }
 }
