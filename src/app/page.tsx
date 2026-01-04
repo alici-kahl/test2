@@ -867,6 +867,7 @@ export default function Page() {
             tz: Intl.DateTimeFormat().resolvedOptions().timeZone || "Europe/Berlin",
             vehicle: { width_m: width, height_m: height, weight_t: weight, axleload_t: axle },
             directions_language: "de-DE",
+            require_clean: true,
           }
         );
 
