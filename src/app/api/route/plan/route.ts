@@ -99,9 +99,21 @@ function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon>
   }
 }
 
-async function callValhalla(origin: string, reqBody: any, avoidPolys: Feature<Polygon>[], timeoutMs: number) {
+// ✅ MINIMAL-ERWEITERUNG:
+// - escape_mode (Option A) an /api/route/valhalla weiterreichen
+// - alternates optional überschreiben (für aggressive Umfahrungen)
+async function callValhalla(
+  origin: string,
+  reqBody: any,
+  avoidPolys: Feature<Polygon>[],
+  timeoutMs: number,
+  escape_mode: boolean = false,
+  alternates_override?: number
+) {
   const payload = {
     ...reqBody,
+    escape_mode: escape_mode || undefined,
+    alternates: typeof alternates_override === "number" ? alternates_override : reqBody?.alternates,
     // Valhalla kann je nach Build avoid_polygons oder exclude_polygons nutzen.
     avoid_polygons: avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined,
     exclude_polygons: avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined,
@@ -116,6 +128,7 @@ async function callValhalla(origin: string, reqBody: any, avoidPolys: Feature<Po
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       signal: controller.signal,
+      cache: "no-store",
     });
 
     const text = await res.text().catch(() => "");
@@ -144,6 +157,7 @@ async function postJSON<T>(origin: string, path: string, body: any, timeoutMs: n
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
       signal: controller.signal,
+      cache: "no-store",
     });
 
     if (!r.ok) return null;
@@ -426,7 +440,8 @@ export async function POST(req: NextRequest) {
       origin,
       plannerReqBase,
       [],
-      Math.min(VALHALLA_TIMEOUT_MS, Math.max(9_000, timeLeft() - 2_500))
+      Math.min(VALHALLA_TIMEOUT_MS, Math.max(9_000, timeLeft() - 2_500)),
+      false
     );
     const route0: FeatureCollection = res0?.geojson ?? { type: "FeatureCollection", features: [] };
 
@@ -586,7 +601,8 @@ export async function POST(req: NextRequest) {
         break;
       }
 
-      const res = await callValhalla(origin, plannerReqBase, avoids, VALHALLA_TIMEOUT_MS);
+      // ✅ Option A: sobald Avoids aktiv sind -> escape_mode true + Alternativen anfordern
+      const res = await callValhalla(origin, plannerReqBase, avoids, VALHALLA_TIMEOUT_MS, true, 3);
       const route: FeatureCollection = res?.geojson ?? { type: "FeatureCollection", features: [] };
 
       if (!route?.features?.length) {
@@ -608,6 +624,24 @@ export async function POST(req: NextRequest) {
       if (best.blockingWarnings.length === 0) {
         stuckReason = null;
         break;
+      }
+    }
+
+    // ✅ finaler ESCAPE-Pass (Option A), falls noch Zeit und immer noch WARN
+    if (best.blockingWarnings.length > 0 && timeLeft() >= VALHALLA_TIMEOUT_MS + 2_500) {
+      const resEsc = await callValhalla(origin, plannerReqBase, avoids, VALHALLA_TIMEOUT_MS, true, 3);
+      const routeEsc: FeatureCollection = resEsc?.geojson ?? { type: "FeatureCollection", features: [] };
+      if (routeEsc?.features?.length) {
+        const statsEsc = computeRouteStats(routeEsc, obstacles, ROUTE_BUFFER_KM, vWidth, vWeight, avoidIds);
+        const candEsc: Candidate = {
+          route: routeEsc,
+          blockingWarnings: statsEsc.blockingWarnings,
+          roadworksHits: statsEsc.roadworksHits,
+          distance_km: extractDistanceKm(routeEsc),
+          meta: { bbox_km: null, avoids_applied: avoids.length, fallback_used: true },
+        };
+        best = pickBetterCandidate(best, candEsc);
+        phases.push({ phase: "ESCAPE_PASS", result: "DONE", avoids_applied: avoids.length });
       }
     }
 
@@ -696,7 +730,10 @@ export async function POST(req: NextRequest) {
       iterations++;
       totalIterations++;
 
-      const res = await callValhalla(origin, plannerReqBase, avoids, VALHALLA_TIMEOUT_MS);
+      // ✅ Option A: sobald Avoids vorhanden sind -> escape_mode true, und Alternativen anfordern
+      const escapeNow = avoids.length > 0;
+      const res = await callValhalla(origin, plannerReqBase, avoids, VALHALLA_TIMEOUT_MS, escapeNow, escapeNow ? 3 : undefined);
+
       const route: FeatureCollection = res?.geojson ?? { type: "FeatureCollection", features: [] };
 
       if (!route?.features?.length) {
@@ -802,7 +839,7 @@ export async function POST(req: NextRequest) {
   }
 
   if (!best?.route?.features?.length && timeLeft() >= VALHALLA_TIMEOUT_MS + 2_500) {
-    const fallbackRes = await callValhalla(origin, plannerReqBase, [], VALHALLA_TIMEOUT_MS);
+    const fallbackRes = await callValhalla(origin, plannerReqBase, [], VALHALLA_TIMEOUT_MS, false);
     const fallbackRoute: FeatureCollection = fallbackRes?.geojson ?? { type: "FeatureCollection", features: [] };
 
     if (fallbackRoute?.features?.length) {
@@ -816,6 +853,24 @@ export async function POST(req: NextRequest) {
       phases.push({ phase: "FALLBACK_NO_ROADWORKS", result: "OK" });
     } else {
       phases.push({ phase: "FALLBACK_NO_ROADWORKS", result: "NO_ROUTE", reason: fallbackRes?.error ?? null });
+    }
+  }
+
+  // ✅ finaler ESCAPE-Pass (Option A) auch für kurze Strecken, falls WARN und noch Zeit
+  if (best?.route?.features?.length && best.blockingWarnings.length > 0 && timeLeft() >= VALHALLA_TIMEOUT_MS + 2_500) {
+    const resEsc = await callValhalla(origin, plannerReqBase, [], VALHALLA_TIMEOUT_MS, true, 3);
+    const routeEsc: FeatureCollection = resEsc?.geojson ?? { type: "FeatureCollection", features: [] };
+    if (routeEsc?.features?.length) {
+      // Ohne zusätzliche Obstacles-BBox (minimal-invasiv), aber Escape kann neue Wege erschließen.
+      const candEsc: Candidate = {
+        route: routeEsc,
+        blockingWarnings: best.blockingWarnings,
+        roadworksHits: best.roadworksHits,
+        distance_km: extractDistanceKm(routeEsc),
+        meta: { bbox_km: best.meta.bbox_km, avoids_applied: best.meta.avoids_applied, fallback_used: best.meta.fallback_used },
+      };
+      best = pickBetterCandidate(best, candEsc);
+      phases.push({ phase: "ESCAPE_PASS", result: "DONE" });
     }
   }
 
