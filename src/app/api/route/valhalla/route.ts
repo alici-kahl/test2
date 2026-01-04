@@ -11,7 +11,7 @@ type VehicleSpec = {
   height_m?: number;
   weight_t?: number;
   axleload_t?: number;
-  hazmat?: boolean; // nicht erzwingen, sondern vom Client übernehmen
+  hazmat?: boolean;
 };
 
 function decodePolyline6(str: string): [number, number][] {
@@ -57,7 +57,6 @@ function valhallaToGeoJSON(response: any) {
     const props: any = {
       leg_index: idx,
       summary: {
-        // Valhalla length ist i.d.R. km (mit units=kilometers)
         distance_km: Number(summary.length || 0),
         duration_s: Number(summary.time || 0),
       },
@@ -77,11 +76,6 @@ function valhallaToGeoJSON(response: any) {
   return { type: "FeatureCollection" as const, features };
 }
 
-/**
- * Grobe Distanz (km) für sinnvolle Defaults bei langen Strecken:
- * - Bei langen Strecken ist "NO PATH" häufiger, wenn Start/Ziel minimal off-road ist.
- * - Daher setzen wir (nur wenn nicht vom Client vorgegeben) einen moderaten Radius.
- */
 function haversineKm(a: Coords, b: Coords) {
   const toRad = (x: number) => (x * Math.PI) / 180;
   const R = 6371;
@@ -103,13 +97,8 @@ function buildValhallaRequest(
     avoid_polygons?: any[];
     directions_language?: string;
     alternates?: number;
-
-    // Radius-Fallback (in Metern). Wenn gesetzt, routet Valhalla zu einem Punkt
-    // innerhalb dieses Radius (stabilisiert "No path could be found" bei Truck).
     start_radius_m?: number;
     end_radius_m?: number;
-
-    // NEU: Escape Mode = maximal aggressiv umfahren (Option A)
     escape_mode?: boolean;
   } = {}
 ) {
@@ -117,58 +106,36 @@ function buildValhallaRequest(
   const hasAvoids =
     Array.isArray(options.avoid_polygons) && options.avoid_polygons.length > 0;
 
-  // Option A: sobald Avoids aktiv sind oder Escape Mode, lassen wir deutlich mehr “Detour-Freiheit”
   const escape = Boolean(options.escape_mode) || hasAvoids;
 
   const truckCosting: any = {
     width: v.width_m ?? 2.55,
     height: v.height_m ?? 4.0,
-
-    // Valhalla erwartet kg
     weight: (v.weight_t ?? 40) * 1000,
     axle_load: (v.axleload_t ?? 10) * 1000,
 
-    // Wichtig für Umfahrungen: nicht auf Autobahnen “kleben”
-    // (0 = wenig Autobahnpräferenz, 1 = maximale Autobahnpräferenz)
     use_highways: escape ? 0.15 : 1.0,
-
-    // Option A: bei Escape lieber “irgendeine” legale Route finden als auf “fastest” zu bestehen
     shortest: escape ? true : false,
 
-    // Penalties: für Escape nicht übertreiben, sonst blockierst du dir mögliche Ausweichstrecken weg
     maneuver_penalty: escape ? 30 : 5,
     gate_penalty: escape ? 5_000 : 300,
     service_penalty: escape ? 2_000 : 0,
 
-    // Hazmat NICHT erzwingen (hazmat=true kann "NO path" stark begünstigen).
     hazmat: Boolean(v.hazmat),
   };
 
   const startLoc: any = { lon: start[0], lat: start[1], type: "break" };
-  if (
-    typeof options.start_radius_m === "number" &&
-    Number.isFinite(options.start_radius_m) &&
-    options.start_radius_m > 0
-  ) {
+  if (Number.isFinite(options.start_radius_m) && (options.start_radius_m as number) > 0) {
     startLoc.radius = options.start_radius_m;
   }
 
   const endLoc: any = { lon: end[0], lat: end[1], type: "break" };
-  if (
-    typeof options.end_radius_m === "number" &&
-    Number.isFinite(options.end_radius_m) &&
-    options.end_radius_m > 0
-  ) {
+  if (Number.isFinite(options.end_radius_m) && (options.end_radius_m as number) > 0) {
     endLoc.radius = options.end_radius_m;
   }
 
-  // Option A: wenn Escape/Avoids aktiv, standardmäßig mehr Alternativen anfordern
   const alternates =
-    options.alternates != null
-      ? options.alternates
-      : escape
-        ? 3
-        : 1;
+    options.alternates != null ? options.alternates : escape ? 3 : 1;
 
   const json: any = {
     locations: [startLoc, endLoc],
@@ -182,7 +149,6 @@ function buildValhallaRequest(
   };
 
   if (hasAvoids) {
-    // beide Keys setzen (kompatibel)
     json.avoid_polygons = options.avoid_polygons;
     json.exclude_polygons = options.avoid_polygons;
   }
@@ -190,22 +156,16 @@ function buildValhallaRequest(
   return json;
 }
 
-/**
- * Liefert eine konsistente Meta-Struktur zurück, die der Client auswerten kann
- * (damit Warnungen auch bei langen Strecken nicht "verschwinden", nur weil Valhalla
- * z.B. andere Status liefert).
- */
-function buildMeta(parsed: any, avoidCount: number) {
+function buildMeta(parsed: any, avoidCount: number, extra?: any) {
   const trip = parsed?.trip;
   const status = trip?.status;
   const statusMessage =
-    trip?.status_message ||
-    parsed?.status_message ||
-    parsed?.error ||
-    parsed?.message ||
+    trip?.status_message ??
+    parsed?.status_message ??
+    parsed?.error ??
+    parsed?.message ??
     null;
 
-  // Valhalla status: 0 = success; alles andere sind Fehler-/Warnfälle
   const ok = status === 0;
 
   return {
@@ -213,10 +173,9 @@ function buildMeta(parsed: any, avoidCount: number) {
     avoid_count: avoidCount,
     raw_status: status ?? null,
     raw_status_message: statusMessage,
-    // Für Debug/Client-Logik hilfreich, ohne Struktur zu verändern
     has_trip: Boolean(trip),
-    has_alternates:
-      Array.isArray(parsed?.alternates) && parsed.alternates.length > 0,
+    has_alternates: Array.isArray(parsed?.alternates) && parsed.alternates.length > 0,
+    ...extra,
   };
 }
 
@@ -226,20 +185,15 @@ export async function POST(req: NextRequest) {
   const end: Coords = body.end ?? [8.68, 50.11];
   const vehicle: VehicleSpec = body.vehicle ?? {};
 
-  // Radius-Parameter (in Metern) aus dem Body
   let start_radius_m =
     typeof body.start_radius_m === "number" ? body.start_radius_m : undefined;
   let end_radius_m =
     typeof body.end_radius_m === "number" ? body.end_radius_m : undefined;
 
-  // NEU (minimal, aber wichtig für lange Strecken):
-  // Wenn der Client keinen Radius setzt und die Strecke "lang" ist,
-  // geben wir Valhalla einen moderaten Snap-Radius, damit es nicht an "off-road"
-  // Start/Ziel scheitert und dann weder Alternativen noch Warn-Infos liefert.
   const distKm = haversineKm(start, end);
   if (distKm >= 80) {
-    if (start_radius_m == null) start_radius_m = 200; // moderat, zerstört i.d.R. keine Logik
-    if (end_radius_m == null) end_radius_m = 300; // Ziel ist häufiger "kritisch"
+    if (start_radius_m == null) start_radius_m = 200;
+    if (end_radius_m == null) end_radius_m = 300;
   }
 
   const geoms: any[] = [];
@@ -249,7 +203,6 @@ export async function POST(req: NextRequest) {
     else if (x.geometry) geoms.push(x.geometry);
   };
 
-  // akzeptiere beide keys
   const srcAvoid = body.avoid_polygons ?? body.exclude_polygons;
   if (srcAvoid) {
     if (Array.isArray(srcAvoid)) srcAvoid.forEach(pushGeom);
@@ -269,12 +222,12 @@ export async function POST(req: NextRequest) {
 
   const controller = new AbortController();
 
-  // Wichtig: maxDuration=60 (Vercel/Next). Wir geben Valhalla mehr Zeit,
-  // ohne den Function-Limit zu sprengen.
-  const timeoutMs =
-    typeof body.timeout_ms === "number" && body.timeout_ms > 0
-      ? Math.min(body.timeout_ms, 55_000)
-      : 45_000;
+  // ✅ KRITISCHER FIX:
+  // In Serverless darf das NICHT 45s default sein.
+  // Default 12s, Hard-Cap 20s.
+  const requested =
+    typeof body.timeout_ms === "number" && body.timeout_ms > 0 ? body.timeout_ms : 12_000;
+  const timeoutMs = Math.min(requested, 20_000);
 
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -287,10 +240,6 @@ export async function POST(req: NextRequest) {
       cache: "no-store",
     });
 
-    clearTimeout(timeout);
-
-    // Valhalla kann bei Fehlern auch Text/HTML liefern (z.B. Reverse-Proxy).
-    // Das darf NICHT zu "Unexpected token" führen -> daher robust parsen.
     const rawText = await vr.text().catch(() => "");
     let parsed: any = null;
     try {
@@ -302,20 +251,11 @@ export async function POST(req: NextRequest) {
     if (!vr.ok) {
       return NextResponse.json(
         {
-          meta: {
+          meta: buildMeta(parsed, geoms.length, {
             ok: false,
-            avoid_count: geoms.length,
             raw_http_status: vr.status,
-            raw_status: parsed?.trip?.status ?? null,
-
-            // Wichtig: keine Mischung aus ?? und ||. Nur ??.
-            raw_status_message:
-              parsed?.trip?.status_message ?? rawText ?? "Valhalla Fehler",
-
-            has_trip: Boolean(parsed?.trip),
-            has_alternates:
-              Array.isArray(parsed?.alternates) && parsed.alternates.length > 0,
-          },
+            timeout_ms_used: timeoutMs,
+          }),
           geojson: { type: "FeatureCollection", features: [] },
           geojson_alts: [] as any[],
         },
@@ -323,7 +263,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Wenn ok=true aber parsed null ist, trotzdem konsistent antworten
     if (!parsed) {
       return NextResponse.json(
         {
@@ -335,6 +274,7 @@ export async function POST(req: NextRequest) {
             raw_status_message: rawText || "Valhalla: Leere/ungültige Antwort",
             has_trip: false,
             has_alternates: false,
+            timeout_ms_used: timeoutMs,
           },
           geojson: { type: "FeatureCollection", features: [] },
           geojson_alts: [] as any[],
@@ -343,20 +283,20 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Hauptroute
     const fc = valhallaToGeoJSON(parsed);
-
-    // Alternativen (Valhalla kann alternates liefern)
     const altsRaw = Array.isArray(parsed?.alternates) ? parsed.alternates : [];
     const geojson_alts = altsRaw.map((alt: any) => valhallaToGeoJSON({ trip: alt }));
 
     return NextResponse.json({
-      meta: buildMeta(parsed, geoms.length),
+      meta: buildMeta(parsed, geoms.length, { timeout_ms_used: timeoutMs }),
       geojson: fc,
       geojson_alts,
     });
   } catch (e: any) {
-    clearTimeout(timeout);
+    const msg = String(e);
+    const isAbort =
+      e?.name === "AbortError" || msg.toLowerCase().includes("abort");
+
     return NextResponse.json(
       {
         meta: {
@@ -364,14 +304,17 @@ export async function POST(req: NextRequest) {
           avoid_count: geoms.length,
           raw_http_status: null,
           raw_status: null,
-          raw_status_message: String(e),
+          raw_status_message: isAbort ? "VALHALLA_TIMEOUT" : msg,
           has_trip: false,
           has_alternates: false,
+          timeout_ms_used: timeoutMs,
         },
         geojson: { type: "FeatureCollection", features: [] },
         geojson_alts: [] as any[],
       },
       { status: 200 }
     );
+  } finally {
+    clearTimeout(timeout);
   }
 }
