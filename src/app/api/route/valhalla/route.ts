@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
+export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
@@ -107,11 +108,17 @@ function buildValhallaRequest(
     // innerhalb dieses Radius (stabilisiert "No path could be found" bei Truck).
     start_radius_m?: number;
     end_radius_m?: number;
+
+    // NEU: Escape Mode = maximal aggressiv umfahren (Option A)
+    escape_mode?: boolean;
   } = {}
 ) {
   const costing = "truck";
   const hasAvoids =
     Array.isArray(options.avoid_polygons) && options.avoid_polygons.length > 0;
+
+  // Option A: sobald Avoids aktiv sind oder Escape Mode, lassen wir deutlich mehr “Detour-Freiheit”
+  const escape = Boolean(options.escape_mode) || hasAvoids;
 
   const truckCosting: any = {
     width: v.width_m ?? 2.55,
@@ -121,13 +128,17 @@ function buildValhallaRequest(
     weight: (v.weight_t ?? 40) * 1000,
     axle_load: (v.axleload_t ?? 10) * 1000,
 
-    // Nur wenn Avoids aktiv sind, erhöhen wir die „Strafen“, sonst normal routen lassen
-    use_highways: hasAvoids ? 0.7 : 1.0,
-    shortest: false,
+    // Wichtig für Umfahrungen: nicht auf Autobahnen “kleben”
+    // (0 = wenig Autobahnpräferenz, 1 = maximale Autobahnpräferenz)
+    use_highways: escape ? 0.15 : 1.0,
 
-    maneuver_penalty: hasAvoids ? 250 : 5,
-    gate_penalty: hasAvoids ? 50_000 : 300,
-    service_penalty: hasAvoids ? 50_000 : 0,
+    // Option A: bei Escape lieber “irgendeine” legale Route finden als auf “fastest” zu bestehen
+    shortest: escape ? true : false,
+
+    // Penalties: für Escape nicht übertreiben, sonst blockierst du dir mögliche Ausweichstrecken weg
+    maneuver_penalty: escape ? 30 : 5,
+    gate_penalty: escape ? 5_000 : 300,
+    service_penalty: escape ? 2_000 : 0,
 
     // Hazmat NICHT erzwingen (hazmat=true kann "NO path" stark begünstigen).
     hazmat: Boolean(v.hazmat),
@@ -151,6 +162,14 @@ function buildValhallaRequest(
     endLoc.radius = options.end_radius_m;
   }
 
+  // Option A: wenn Escape/Avoids aktiv, standardmäßig mehr Alternativen anfordern
+  const alternates =
+    options.alternates != null
+      ? options.alternates
+      : escape
+        ? 3
+        : 1;
+
   const json: any = {
     locations: [startLoc, endLoc],
     costing,
@@ -159,7 +178,7 @@ function buildValhallaRequest(
       language: options.directions_language || "de-DE",
       units: "kilometers",
     },
-    alternates: options.alternates ?? 1,
+    alternates,
   };
 
   if (hasAvoids) {
@@ -245,6 +264,7 @@ export async function POST(req: NextRequest) {
     alternates: body.alternates,
     start_radius_m,
     end_radius_m,
+    escape_mode: Boolean(body.escape_mode),
   });
 
   const controller = new AbortController();
@@ -264,6 +284,7 @@ export async function POST(req: NextRequest) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(requestJson),
       signal: controller.signal,
+      cache: "no-store",
     });
 
     clearTimeout(timeout);
@@ -287,7 +308,7 @@ export async function POST(req: NextRequest) {
             raw_http_status: vr.status,
             raw_status: parsed?.trip?.status ?? null,
 
-            // FIX (Build-Fehler): keine Mischung aus ?? und ||; nur ?? verwenden.
+            // Wichtig: keine Mischung aus ?? und ||. Nur ??.
             raw_status_message:
               parsed?.trip?.status_message ?? rawText ?? "Valhalla Fehler",
 
@@ -325,8 +346,7 @@ export async function POST(req: NextRequest) {
     // Hauptroute
     const fc = valhallaToGeoJSON(parsed);
 
-    // Alternativen (Valhalla kann alternates liefern; wir geben sie dem Client mit,
-    // damit du bei langen Strecken auch "Umfahrungen" bekommst, wenn vorhanden).
+    // Alternativen (Valhalla kann alternates liefern)
     const altsRaw = Array.isArray(parsed?.alternates) ? parsed.alternates : [];
     const geojson_alts = altsRaw.map((alt: any) => valhallaToGeoJSON({ trip: alt }));
 
