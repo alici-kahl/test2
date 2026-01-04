@@ -302,6 +302,33 @@ function chunkRouteToBBoxes(coords: Coords[], chunkKm: number, overlapKm: number
   });
 }
 
+/**
+ * ✅ Minimal-Fix für FAST_PATH:
+ * Statt "die ersten N Boxen" nehmen wir N Boxen gleichmäßig verteilt über die Route,
+ * damit lange Strecken nicht nur am Anfang Roadworks laden.
+ */
+function pickSpreadBoxes<T>(arr: T[], max: number): T[] {
+  if (!Array.isArray(arr) || arr.length <= max) return arr;
+  if (max <= 1) return [arr[0]];
+
+  const out: T[] = [];
+  const n = arr.length;
+
+  for (let i = 0; i < max; i++) {
+    const idx = Math.round((i * (n - 1)) / (max - 1));
+    out.push(arr[idx]);
+  }
+
+  // Dedupe (falls Rundung gleiche Indizes produziert)
+  const seen = new Set<string>();
+  return out.filter((x, i) => {
+    const k = `${i}-${JSON.stringify(x)}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
 function mergeObstacles(featuresList: Feature<any>[][], cap: number) {
   const out: Feature<any>[] = [];
   const seen = new Set<string>();
@@ -476,9 +503,9 @@ export async function POST(req: NextRequest) {
 
     const boxesAll = chunkRouteToBBoxes(coords, chunkKm, overlapKm, expandKm);
 
-    // Budget-sicher: max 4 Boxen
+    // Budget-sicher: max 4 Boxen (aber jetzt über die Route verteilt)
     const MAX_BOXES_FAST = 4;
-    const boxes = boxesAll.slice(0, MAX_BOXES_FAST);
+    const boxes = pickSpreadBoxes(boxesAll, MAX_BOXES_FAST);
 
     const onlyMotorways = body.roadworks?.only_motorways ?? false;
 
