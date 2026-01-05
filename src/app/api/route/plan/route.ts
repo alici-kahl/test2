@@ -111,7 +111,7 @@ function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon>
   const latRad = (lat * Math.PI) / 180;
   const dLat = km / 110.574; // km pro Breitengrad
   const cosLat = Math.cos(latRad);
-  const dLon = km / (111.320 * (Math.abs(cosLat) < 1e-6 ? 1 : cosLat)); // km pro Längengrad
+  const dLon = km / (111.32 * (Math.abs(cosLat) < 1e-6 ? 1 : cosLat)); // km pro Längengrad
 
   const b: [number, number, number, number] = [lon - dLon, lat - dLat, lon + dLon, lat + dLat];
 
@@ -193,6 +193,37 @@ async function postJSON<T>(origin: string, path: string, body: any, timeoutMs: n
     return (await r.json()) as T;
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Precheck-Call: zweite Ebene VOR Routing.
+ * Wichtig: Wir blocken hier NICHT hart, außer require_clean=true,
+ * damit du so selten wie möglich "BLOCKED" siehst.
+ */
+async function callPrecheck(origin: string, payload: any, timeoutMs: number) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(`${origin}/api/route/precheck`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+      cache: "no-store",
+    });
+
+    const text = await res.text().catch(() => "");
+    try {
+      return { ok: res.ok, data: JSON.parse(text) };
+    } catch {
+      return { ok: false, data: { status: "WARN", error: "Precheck returned non-JSON", raw: text?.slice?.(0, 200) } };
+    }
+  } catch (e: any) {
+    return { ok: false, data: { status: "WARN", error: String(e) } };
   } finally {
     clearTimeout(timer);
   }
@@ -489,9 +520,67 @@ export async function POST(req: NextRequest) {
 
     const roadworksBufferM = body.roadworks?.buffer_m ?? 60;
 
+    // --- PRECHECK (2. Ebene) ---
+    // Wichtig: Damit du "so selten wie möglich BLOCKED" siehst,
+    // brechen wir nur hart ab, wenn require_clean=true.
+    if (timeLeft() > 3_000) {
+      const precheckPayload = {
+        start,
+        end,
+        vehicle: body.vehicle,
+        roadworks: body.roadworks,
+      };
+
+      const pre = await callPrecheck(origin, precheckPayload, 2_800);
+
+      if (pre.ok && pre.data) {
+        phases.push({
+          phase: "PRECHECK",
+          result: pre.data?.status ?? "UNKNOWN",
+          clean: pre.data?.clean ?? null,
+          blocking_count: pre.data?.blocking_count ?? null,
+          message: pre.data?.message ?? null,
+        });
+
+        if (pre.data?.status === "BLOCKED" && requireClean) {
+          // require_clean verlangt CLEAN-only => hier korrekt BLOCKED
+          return NextResponse.json({
+            meta: {
+              source: "route/plan-v21-least-roadworks",
+              status: "BLOCKED",
+              clean: false,
+              error:
+                "Precheck: Korridor ist grundsätzlich nicht befahrbar (require_clean=true). " +
+                "Es wurde daher kein Routing gestartet.",
+              iterations: totalIterations,
+              avoids_applied: 0,
+              bbox_km_used: null,
+              fallback_used: false,
+              phases,
+            },
+            avoid_applied: { total: 0 },
+            geojson: { type: "FeatureCollection", features: [] },
+            blocking_warnings: pre.data?.blocking ?? [],
+            geojson_alts: [],
+          });
+        }
+        // Wenn require_clean=false: KEIN harter Abbruch, wir routen trotzdem weiter
+      } else {
+        phases.push({
+          phase: "PRECHECK",
+          result: "WARN",
+          clean: null,
+          reason: pre.data?.error ?? "Precheck failed/timeout",
+        });
+      }
+    } else {
+      phases.push({ phase: "PRECHECK", result: "SKIPPED", reason: "time_budget_low" });
+    }
+    // --- PRECHECK ENDE ---
+
     // Avoid-Puffer: Roadworks-Buffer + Sicherheitsmarge für breite Fahrzeuge
     const baseAvoidKm = Math.max(0.03, roadworksBufferM / 1000);
-    const widthExtraKm = Math.min(0.35, Math.max(0, (vWidth - 2.55) * 0.020)); // etwas aggressiver
+    const widthExtraKm = Math.min(0.35, Math.max(0, (vWidth - 2.55) * 0.02)); // etwas aggressiver
     const avoidBufferKmBase = Math.max(baseAvoidKm, baseAvoidKm + widthExtraKm);
 
     const corridorWidthM = body.corridor?.width_m ?? 2000;
@@ -553,7 +642,7 @@ export async function POST(req: NextRequest) {
               avoids_applied: 0,
               bbox_km_used: null,
               fallback_used: true,
-              phases: [{ phase: "FAST_PATH", approx_km: approxKm, result: "TIME_BUDGET" }],
+              phases: phases.concat([{ phase: "FAST_PATH", approx_km: approxKm, result: "TIME_BUDGET" }]),
             },
             avoid_applied: { total: 0 },
             geojson: { type: "FeatureCollection", features: [] },
@@ -579,7 +668,7 @@ export async function POST(req: NextRequest) {
               avoids_applied: 0,
               bbox_km_used: null,
               fallback_used: true,
-              phases: [{ phase: "FAST_PATH", approx_km: approxKm, result: "NO_ROUTE", reason: res0?.error ?? null }],
+              phases: phases.concat([{ phase: "FAST_PATH", approx_km: approxKm, result: "NO_ROUTE", reason: res0?.error ?? null }]),
             },
             avoid_applied: { total: 0 },
             geojson: { type: "FeatureCollection", features: [] },
