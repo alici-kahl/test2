@@ -89,6 +89,31 @@ function haversineKm(a: Coords, b: Coords) {
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
 }
 
+/**
+ * ✅ NEU: Locations aus Body akzeptieren (statt zu ignorieren).
+ * Erwartet Valhalla-Format: [{lon,lat,...},{lon,lat,...}]
+ * Wir nutzen nur Start+Ende (erste+letzte), damit dein bestehendes System gleich bleibt.
+ */
+function normalizeLocations(locations: any): { start: any; end: any } | null {
+  if (!Array.isArray(locations) || locations.length < 2) return null;
+
+  const first = locations[0];
+  const last = locations[locations.length - 1];
+
+  const lon1 = Number(first?.lon);
+  const lat1 = Number(first?.lat);
+  const lon2 = Number(last?.lon);
+  const lat2 = Number(last?.lat);
+
+  if (![lon1, lat1, lon2, lat2].every((n) => Number.isFinite(n))) return null;
+
+  // type & radius ggf. übernehmen, aber auf break normalisieren
+  const start = { ...first, lon: lon1, lat: lat1, type: "break" };
+  const end = { ...last, lon: lon2, lat: lat2, type: "break" };
+
+  return { start, end };
+}
+
 function buildValhallaRequest(
   start: Coords,
   end: Coords,
@@ -181,8 +206,38 @@ function buildMeta(parsed: any, avoidCount: number, extra?: any) {
 
 export async function POST(req: NextRequest) {
   const body = (await req.json().catch(() => ({}))) as any;
-  const start: Coords = body.start ?? [6.96, 50.94];
-  const end: Coords = body.end ?? [8.68, 50.11];
+
+  // ✅ NEU: locations zuerst prüfen
+  const locs = normalizeLocations(body.locations);
+
+  // Wenn locations vorhanden -> daraus start/end ableiten
+  const start: Coords = locs ? [locs.start.lon, locs.start.lat] : (body.start ?? [6.96, 50.94]);
+  const end: Coords = locs ? [locs.end.lon, locs.end.lat] : (body.end ?? [8.68, 50.11]);
+
+  // ✅ Zusätzliche Absicherung gegen "locations fehlt"
+  if (
+    !Array.isArray(start) || start.length !== 2 ||
+    !Array.isArray(end) || end.length !== 2 ||
+    !start.every((n) => Number.isFinite(Number(n))) ||
+    !end.every((n) => Number.isFinite(Number(n)))
+  ) {
+    return NextResponse.json(
+      {
+        meta: {
+          ok: false,
+          raw_http_status: null,
+          raw_status: null,
+          raw_status_message: "VALHALLA_INVALID_INPUT: start/end oder locations ungültig",
+          has_trip: false,
+          has_alternates: false,
+        },
+        geojson: { type: "FeatureCollection", features: [] },
+        geojson_alts: [] as any[],
+      },
+      { status: 200 }
+    );
+  }
+
   const vehicle: VehicleSpec = body.vehicle ?? {};
 
   let start_radius_m =
@@ -190,10 +245,14 @@ export async function POST(req: NextRequest) {
   let end_radius_m =
     typeof body.end_radius_m === "number" ? body.end_radius_m : undefined;
 
+  // Radius-Heuristik nur anwenden, wenn locations keinen Radius schon vorgibt
   const distKm = haversineKm(start, end);
   if (distKm >= 80) {
-    if (start_radius_m == null) start_radius_m = 200;
-    if (end_radius_m == null) end_radius_m = 300;
+    const locStartHasRadius = locs ? Number.isFinite(Number(locs.start?.radius)) : false;
+    const locEndHasRadius = locs ? Number.isFinite(Number(locs.end?.radius)) : false;
+
+    if (!locStartHasRadius && start_radius_m == null) start_radius_m = 200;
+    if (!locEndHasRadius && end_radius_m == null) end_radius_m = 300;
   }
 
   const geoms: any[] = [];
@@ -219,6 +278,22 @@ export async function POST(req: NextRequest) {
     end_radius_m,
     escape_mode: Boolean(body.escape_mode),
   });
+
+  // ✅ NEU: Wenn locations mitgegeben wurden, überschreiben wir requestJson.locations sauber
+  if (locs) {
+    const startLoc: any = { ...locs.start };
+    const endLoc: any = { ...locs.end };
+
+    // Falls wir durch Heuristik einen Radius setzen sollen und keiner existiert:
+    if (startLoc.radius == null && Number.isFinite(start_radius_m as number) && (start_radius_m as number) > 0) {
+      startLoc.radius = start_radius_m;
+    }
+    if (endLoc.radius == null && Number.isFinite(end_radius_m as number) && (end_radius_m as number) > 0) {
+      endLoc.radius = end_radius_m;
+    }
+
+    requestJson.locations = [startLoc, endLoc];
+  }
 
   const controller = new AbortController();
 
