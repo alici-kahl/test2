@@ -151,23 +151,20 @@ async function callValhalla(
 ) {
   const hasAvoids = avoidPolys.length > 0;
 
-  const payload: any = {
+  const payload = buildValhallaPayload(
+  reqBody.start,
+  reqBody.end,
+  {
     ...reqBody,
     escape_mode: hasAvoids ? Boolean(escape_mode) : undefined,
-    alternates: typeof alternates_override === "number" ? alternates_override : reqBody?.alternates,
-
-    /**
-     * ✅ KRITISCH:
-     * Valhalla ist am stabilsten mit FeatureCollection.
-     * Damit werden Avoids nicht "weginterpretiert" und gehen nicht still verloren.
-     */
+    alternates: typeof alternates_override === "number"
+      ? alternates_override
+      : reqBody?.alternates,
     avoid_polygons: hasAvoids
-      ? {
-          type: "FeatureCollection",
-          features: avoidPolys,
-        }
+      ? { type: "FeatureCollection", features: avoidPolys }
       : undefined,
-  };
+  }
+);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
