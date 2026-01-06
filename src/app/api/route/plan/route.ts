@@ -39,14 +39,47 @@ type PlanReq = {
   require_clean?: boolean;
 };
 
-// ✅ FEHLENDER FIX – MUSS GENAU HIER STEHEN
-function buildValhallaPayload(
-  _start: Coords,
-  _end: Coords,
-  payload: any
-) {
+// ✅ NEU – so SOLL es aussehen
+function buildValhallaPayload(start: Coords, end: Coords, p: any) {
+  if (
+    !Array.isArray(start) || start.length !== 2 ||
+    !Array.isArray(end) || end.length !== 2
+  ) {
+    throw new Error("Valhalla payload error: invalid start/end");
+  }
+
+  const vehicle = p.vehicle ?? {};
+
+  const payload: any = {
+    locations: [
+      { lon: start[0], lat: start[1], type: "break" },
+      { lon: end[0], lat: end[1], type: "break" },
+    ],
+    costing: "truck",
+    directions_options: {
+      language: p.directions_language ?? "de-DE",
+      units: "kilometers",
+    },
+    alternates: typeof p.alternates === "number" ? p.alternates : 0,
+    costing_options: {
+      truck: {
+        width: vehicle.width_m ?? 2.55,
+        height: vehicle.height_m ?? 4.0,
+        weight: (vehicle.weight_t ?? 40) * 1000,
+        axle_load: (vehicle.axleload_t ?? 10) * 1000,
+        hazmat: Boolean(vehicle.hazmat),
+      },
+    },
+  };
+
+  if (Array.isArray(p.avoid_polygons?.features)) {
+    payload.avoid_polygons = p.avoid_polygons;
+    payload.exclude_polygons = p.avoid_polygons;
+  }
+
   return payload;
 }
+
 
 function makeSafeBBox(start: Coords, end: Coords, bufferKm: number): [number, number, number, number] {
   const line = lineString([start, end]);
