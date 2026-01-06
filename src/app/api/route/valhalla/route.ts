@@ -89,29 +89,26 @@ function haversineKm(a: Coords, b: Coords) {
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
 }
 
-/**
- * ✅ NEU: Locations aus Body akzeptieren (statt zu ignorieren).
- * Erwartet Valhalla-Format: [{lon,lat,...},{lon,lat,...}]
- * Wir nutzen nur Start+Ende (erste+letzte), damit dein bestehendes System gleich bleibt.
- */
-function normalizeLocations(locations: any): { start: any; end: any } | null {
-  if (!Array.isArray(locations) || locations.length < 2) return null;
+function toNum(x: any): number | null {
+  const n = typeof x === "string" ? Number(x) : typeof x === "number" ? x : NaN;
+  return Number.isFinite(n) ? n : null;
+}
 
-  const first = locations[0];
-  const last = locations[locations.length - 1];
-
-  const lon1 = Number(first?.lon);
-  const lat1 = Number(first?.lat);
-  const lon2 = Number(last?.lon);
-  const lat2 = Number(last?.lat);
-
-  if (![lon1, lat1, lon2, lat2].every((n) => Number.isFinite(n))) return null;
-
-  // type & radius ggf. übernehmen, aber auf break normalisieren
-  const start = { ...first, lon: lon1, lat: lat1, type: "break" };
-  const end = { ...last, lon: lon2, lat: lat2, type: "break" };
-
-  return { start, end };
+function normalizeCoords(input: any): Coords | null {
+  // Erwartet: [lon, lat] (Array) oder { lon, lat } oder { lng, lat }
+  if (Array.isArray(input) && input.length >= 2) {
+    const lon = toNum(input[0]);
+    const lat = toNum(input[1]);
+    if (lon == null || lat == null) return null;
+    return [lon, lat];
+  }
+  if (input && typeof input === "object") {
+    const lon = toNum(input.lon ?? input.lng);
+    const lat = toNum(input.lat);
+    if (lon == null || lat == null) return null;
+    return [lon, lat];
+  }
+  return null;
 }
 
 function buildValhallaRequest(
@@ -139,6 +136,7 @@ function buildValhallaRequest(
     weight: (v.weight_t ?? 40) * 1000,
     axle_load: (v.axleload_t ?? 10) * 1000,
 
+    // Escape-Modus bewusst "weich": Valhalla soll eher ausweichen, aber nicht komplett instabil werden
     use_highways: escape ? 0.15 : 1.0,
     shortest: escape ? true : false,
 
@@ -159,13 +157,18 @@ function buildValhallaRequest(
     endLoc.radius = options.end_radius_m;
   }
 
-  const alternates =
+  const alternatesRaw =
     options.alternates != null ? options.alternates : escape ? 3 : 1;
+  const alternates = Math.max(0, Math.min(15, Number(alternatesRaw) || 0));
 
   const json: any = {
     locations: [startLoc, endLoc],
     costing,
     costing_options: { truck: truckCosting },
+
+    // Wichtig: wir decoden polyline6, daher explizit anfordern
+    shape_format: "polyline6",
+
     directions_options: {
       language: options.directions_language || "de-DE",
       units: "kilometers",
@@ -173,9 +176,9 @@ function buildValhallaRequest(
     alternates,
   };
 
+  // Nur avoid_polygons – exclude_polygons weglassen, um doppelte/unklare Interpretation zu vermeiden
   if (hasAvoids) {
     json.avoid_polygons = options.avoid_polygons;
-    json.exclude_polygons = options.avoid_polygons;
   }
 
   return json;
@@ -204,30 +207,66 @@ function buildMeta(parsed: any, avoidCount: number, extra?: any) {
   };
 }
 
+function looksLikeMissingLocations(msg: any) {
+  const s = String(msg || "").toLowerCase();
+  return s.includes("required parameter 'locations'") || s.includes("parameter \"locations\"") || s.includes("locations");
+}
+
+async function fetchValhalla(
+  url: string,
+  requestJson: any,
+  timeoutMs: number,
+  controller: AbortController
+) {
+  const vr = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(requestJson),
+    signal: controller.signal,
+    cache: "no-store",
+  });
+
+  const rawText = await vr.text().catch(() => "");
+  let parsed: any = null;
+  try {
+    parsed = rawText ? JSON.parse(rawText) : null;
+  } catch {
+    parsed = null;
+  }
+
+  return { vr, rawText, parsed };
+}
+
 export async function POST(req: NextRequest) {
   const body = (await req.json().catch(() => ({}))) as any;
 
-  // ✅ NEU: locations zuerst prüfen
-  const locs = normalizeLocations(body.locations);
+  // Robust: start/end aus body.start/body.end ODER fallback auf body.locations
+  let start: Coords | null = normalizeCoords(body.start);
+  let end: Coords | null = normalizeCoords(body.end);
 
-  // Wenn locations vorhanden -> daraus start/end ableiten
-  const start: Coords = locs ? [locs.start.lon, locs.start.lat] : (body.start ?? [6.96, 50.94]);
-  const end: Coords = locs ? [locs.end.lon, locs.end.lat] : (body.end ?? [8.68, 50.11]);
+  if ((!start || !end) && Array.isArray(body.locations) && body.locations.length >= 2) {
+    const a = body.locations[0];
+    const b = body.locations[1];
+    const s = normalizeCoords([a?.lon ?? a?.lng, a?.lat]);
+    const e = normalizeCoords([b?.lon ?? b?.lng, b?.lat]);
+    start = start ?? s;
+    end = end ?? e;
+  }
 
-  // ✅ Zusätzliche Absicherung gegen "locations fehlt"
-  if (
-    !Array.isArray(start) || start.length !== 2 ||
-    !Array.isArray(end) || end.length !== 2 ||
-    !start.every((n) => Number.isFinite(Number(n))) ||
-    !end.every((n) => Number.isFinite(Number(n)))
-  ) {
+  // Letzter Fallback (wie vorher)
+  start = start ?? [6.96, 50.94];
+  end = end ?? [8.68, 50.11];
+
+  // Wenn trotz allem kaputt: sauber abbrechen (statt Valhalla mit Müll zu füttern)
+  if (!start || !end || !Number.isFinite(start[0]) || !Number.isFinite(start[1]) || !Number.isFinite(end[0]) || !Number.isFinite(end[1])) {
     return NextResponse.json(
       {
         meta: {
           ok: false,
+          avoid_count: 0,
           raw_http_status: null,
           raw_status: null,
-          raw_status_message: "VALHALLA_INVALID_INPUT: start/end oder locations ungültig",
+          raw_status_message: "INVALID_START_END",
           has_trip: false,
           has_alternates: false,
         },
@@ -245,21 +284,17 @@ export async function POST(req: NextRequest) {
   let end_radius_m =
     typeof body.end_radius_m === "number" ? body.end_radius_m : undefined;
 
-  // Radius-Heuristik nur anwenden, wenn locations keinen Radius schon vorgibt
   const distKm = haversineKm(start, end);
   if (distKm >= 80) {
-    const locStartHasRadius = locs ? Number.isFinite(Number(locs.start?.radius)) : false;
-    const locEndHasRadius = locs ? Number.isFinite(Number(locs.end?.radius)) : false;
-
-    if (!locStartHasRadius && start_radius_m == null) start_radius_m = 200;
-    if (!locEndHasRadius && end_radius_m == null) end_radius_m = 300;
+    if (start_radius_m == null) start_radius_m = 200;
+    if (end_radius_m == null) end_radius_m = 300;
   }
 
   const geoms: any[] = [];
   const pushGeom = (x: any) => {
     if (!x) return;
     if (x.type === "Polygon" || x.type === "MultiPolygon") geoms.push(x);
-    else if (x.geometry) geoms.push(x.geometry);
+    else if (x.geometry && (x.geometry.type === "Polygon" || x.geometry.type === "MultiPolygon")) geoms.push(x.geometry);
   };
 
   const srcAvoid = body.avoid_polygons ?? body.exclude_polygons;
@@ -279,27 +314,9 @@ export async function POST(req: NextRequest) {
     escape_mode: Boolean(body.escape_mode),
   });
 
-  // ✅ NEU: Wenn locations mitgegeben wurden, überschreiben wir requestJson.locations sauber
-  if (locs) {
-    const startLoc: any = { ...locs.start };
-    const endLoc: any = { ...locs.end };
-
-    // Falls wir durch Heuristik einen Radius setzen sollen und keiner existiert:
-    if (startLoc.radius == null && Number.isFinite(start_radius_m as number) && (start_radius_m as number) > 0) {
-      startLoc.radius = start_radius_m;
-    }
-    if (endLoc.radius == null && Number.isFinite(end_radius_m as number) && (end_radius_m as number) > 0) {
-      endLoc.radius = end_radius_m;
-    }
-
-    requestJson.locations = [startLoc, endLoc];
-  }
-
   const controller = new AbortController();
 
-  // ✅ KRITISCHER FIX:
-  // In Serverless darf das NICHT 45s default sein.
-  // Default 12s, Hard-Cap 20s.
+  // Serverless: Default 12s, Hard-Cap 20s
   const requested =
     typeof body.timeout_ms === "number" && body.timeout_ms > 0 ? body.timeout_ms : 12_000;
   const timeoutMs = Math.min(requested, 20_000);
@@ -307,20 +324,48 @@ export async function POST(req: NextRequest) {
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const vr = await fetch(valhallaURL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requestJson),
-      signal: controller.signal,
-      cache: "no-store",
-    });
+    // 1) Normaler POST
+    let { vr, rawText, parsed } = await fetchValhalla(valhallaURL, requestJson, timeoutMs, controller);
 
-    const rawText = await vr.text().catch(() => "");
-    let parsed: any = null;
-    try {
-      parsed = rawText ? JSON.parse(rawText) : null;
-    } catch {
-      parsed = null;
+    // 2) Fallback: Manche Proxies/Setups verlieren POST-Bodies -> Valhalla sieht "keine locations"
+    //    Dann versuchen wir EINMAL GET ?json= (nur wenn Payload klein genug ist, sonst URL zu lang).
+    const msg =
+      parsed?.trip?.status_message ??
+      parsed?.status_message ??
+      parsed?.error ??
+      parsed?.message ??
+      rawText;
+
+    const requestStr = JSON.stringify(requestJson);
+    const canTryGetFallback = requestStr.length <= 6000 && geoms.length === 0; // bewusst konservativ
+
+    if (!vr.ok || (looksLikeMissingLocations(msg) && canTryGetFallback)) {
+      if (looksLikeMissingLocations(msg) && canTryGetFallback) {
+        const sep = valhallaURL.includes("?") ? "&" : "?";
+        const urlGet = `${valhallaURL}${sep}json=${encodeURIComponent(requestStr)}`;
+
+        const vr2 = await fetch(urlGet, {
+          method: "GET",
+          headers: { Accept: "application/json" },
+          signal: controller.signal,
+          cache: "no-store",
+        });
+
+        const rawText2 = await vr2.text().catch(() => "");
+        let parsed2: any = null;
+        try {
+          parsed2 = rawText2 ? JSON.parse(rawText2) : null;
+        } catch {
+          parsed2 = null;
+        }
+
+        // nur ersetzen, wenn wir damit wirklich weiterkommen
+        if (vr2.ok && parsed2) {
+          vr = vr2 as any;
+          rawText = rawText2;
+          parsed = parsed2;
+        }
+      }
     }
 
     if (!vr.ok) {
