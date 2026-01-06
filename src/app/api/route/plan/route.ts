@@ -36,19 +36,24 @@ type PlanReq = {
   avoid_target_max?: number;
   valhalla_soft_max?: number;
   respect_direction?: boolean;
-
-  /**
-   * Wenn true, wird NUR eine CLEAN-Route akzeptiert (keine blockierenden Baustellen).
-   * Wenn nach allen Versuchen keine CLEAN-Route gefunden wird => status=BLOCKED und geojson leer.
-   */
   require_clean?: boolean;
 };
+
+// ✅ FEHLENDER FIX – MUSS GENAU HIER STEHEN
+function buildValhallaPayload(
+  _start: Coords,
+  _end: Coords,
+  payload: any
+) {
+  return payload;
+}
 
 function makeSafeBBox(start: Coords, end: Coords, bufferKm: number): [number, number, number, number] {
   const line = lineString([start, end]);
   const buffered = buffer(line, bufferKm, { units: "kilometers" });
   return bboxFn(buffered) as [number, number, number, number];
 }
+
 
 function getLimits(p: any) {
   const width =
