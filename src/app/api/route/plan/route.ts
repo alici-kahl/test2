@@ -12,6 +12,15 @@ export const maxDuration = 60;
 // WICHTIG: sicherstellen, dass das NICHT als Edge-Route läuft (Edge hat andere Limits/Verhalten)
 export const runtime = "nodejs";
 
+/**
+ * ✅ KRITISCHER FIX:
+ * Plan -> Valhalla NICHT über `${origin}/api/route/valhalla` (Proxy/Mapping-Risiko),
+ * sondern DIREKT an deine Valhalla-Instanz.
+ *
+ * (Wenn du später unbedingt wieder via Proxy willst, muss dort 1:1 Payload-Passthrough garantiert sein.)
+ */
+const VALHALLA_URL = "http://159.69.22.206:8002/route";
+
 type Coords = [number, number];
 
 type PlanReq = {
@@ -128,33 +137,49 @@ function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon>
 
 /**
  * callValhalla:
- * - escape_mode an /api/route/valhalla weiterreichen
- * - alternates optional überschreiben
- * - avoid_polygons setzen
+ * - ✅ DIREKT an VALHALLA_URL
+ * - ✅ avoid_polygons im STABILEN Format (FeatureCollection) statt "nur geometry[]"
+ *   (verhindert silent drops / Parsing-Probleme / Proxy-Mappings)
  */
 async function callValhalla(
-  origin: string,
+  origin: string, // bleibt aus Kompatibilitätsgründen im Signature (wird für Valhalla selbst nicht genutzt)
   reqBody: any,
   avoidPolys: Feature<Polygon>[],
   timeoutMs: number,
   escape_mode: boolean = false,
   alternates_override?: number
 ) {
-  const payload = {
+  const hasAvoids = avoidPolys.length > 0;
+
+  const payload: any = {
     ...reqBody,
-    escape_mode: escape_mode || undefined,
+    escape_mode: hasAvoids ? Boolean(escape_mode) : undefined,
     alternates: typeof alternates_override === "number" ? alternates_override : reqBody?.alternates,
-    // Wichtig: nur avoid_polygons verwenden (klarer, weniger "doppelte" Interpretation)
-    avoid_polygons: avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined,
+
+    /**
+     * ✅ KRITISCH:
+     * Valhalla ist am stabilsten mit FeatureCollection.
+     * Damit werden Avoids nicht "weginterpretiert" und gehen nicht still verloren.
+     */
+    avoid_polygons: hasAvoids
+      ? {
+          type: "FeatureCollection",
+          features: avoidPolys,
+        }
+      : undefined,
   };
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const res = await fetch(`${origin}/api/route/valhalla`, {
+    const res = await fetch(VALHALLA_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        // Optional, aber hilft bei bestimmten Proxies/Setups:
+        Accept: "application/json",
+      },
       body: JSON.stringify(payload),
       signal: controller.signal,
       cache: "no-store",
@@ -724,7 +749,13 @@ export async function POST(req: NextRequest) {
       );
 
       const seedObstaclesRaw: Feature<any>[] = (rwSeed?.features ?? []) as Feature<any>[];
-      const seedObstacles = prioritizeObstacles(seedObstaclesRaw, start, end, Math.min(120, Math.max(corridorKm, 30)), 2200);
+      const seedObstacles = prioritizeObstacles(
+        seedObstaclesRaw,
+        start,
+        end,
+        Math.min(120, Math.max(corridorKm, 30)),
+        2200
+      );
 
       // Seed-Cap: breitere Fahrzeuge -> etwas mehr Seed-Avoids
       const SEED_CAP = Math.min(MAX_AVOIDS_GLOBAL, IS_WIDE ? 28 : 20);
@@ -780,7 +811,14 @@ export async function POST(req: NextRequest) {
       }
 
       // NEU: wenn Seed-Avoids existieren, direkt mit escape_mode starten
-      const res0 = await callValhalla(origin, plannerReqBase, seedAvoids, baseValhallaTimeout, seedAvoids.length > 0, seedAvoids.length > 0 ? 7 : undefined);
+      const res0 = await callValhalla(
+        origin,
+        plannerReqBase,
+        seedAvoids,
+        baseValhallaTimeout,
+        seedAvoids.length > 0,
+        seedAvoids.length > 0 ? 7 : undefined
+      );
       const route0: FeatureCollection = res0?.geojson ?? { type: "FeatureCollection", features: [] };
 
       if (!route0?.features?.length) {
@@ -801,7 +839,13 @@ export async function POST(req: NextRequest) {
                 bbox_km_used: null,
                 fallback_used: true,
                 phases: phases.concat([
-                  { phase: "FAST_PATH", approx_km: approxKm, result: "NO_ROUTE", reason: res0?.error ?? null, seeded: seedAvoids.length },
+                  {
+                    phase: "FAST_PATH",
+                    approx_km: approxKm,
+                    result: "NO_ROUTE",
+                    reason: res0?.error ?? null,
+                    seeded: seedAvoids.length,
+                  },
                   { phase: "FAST_PATH_NO_SEED", result: "NO_ROUTE", reason: resNoSeed?.error ?? null },
                 ]),
               },
