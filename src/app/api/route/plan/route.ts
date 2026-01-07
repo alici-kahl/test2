@@ -1083,7 +1083,7 @@ export async function POST(req: NextRequest) {
               if (blockingObs.length >= MAX_BLOCKING_SCAN) break;
             }
           }
-
+        }
 
         blockingObs.sort((a, b) => {
           const la = getLimits(a.properties);
