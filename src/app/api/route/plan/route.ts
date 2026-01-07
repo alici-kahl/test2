@@ -60,6 +60,17 @@ function blocksVehicle(
   vWidth: number,
   vWeight: number
 ) {
+  const blocksWidth = typeof limits.width === "number" && limits.width > 0 && limits.width < vWidth;
+  const blocksWeight = typeof limits.weight === "number" && limits.weight > 0 && limits.weight < vWeight;
+  return { blocksWidth, blocksWeight, blocksAny: blocksWidth || blocksWeight };
+}
+
+
+function blocksVehicle(
+  limits: { width: number | null; weight: number | null },
+  vWidth: number,
+  vWeight: number
+) {
   const w = limits.width;
   const wt = limits.weight;
 
