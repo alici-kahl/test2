@@ -41,20 +41,17 @@ function makeSafeBBox(start: Coords, end: Coords, bufferKm: number): [number, nu
   return bboxFn(buffered) as [number, number, number, number];
 }
 
+function normalizeLimit(v: any): number | null {
+  if (v === null || v === undefined) return null;
+  const n = typeof v === "string" ? Number(v.replace(",", ".")) : Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n;
+}
+
 function getLimits(p: any) {
-  const width =
-    (typeof p?.max_width_m === "number" ? p.max_width_m : null) ??
-    (typeof p?.max_width === "number" ? p.max_width : null) ??
-    999;
-
-  const weight =
-    (typeof p?.max_weight_t === "number" ? p.max_weight_t : null) ??
-    (typeof p?.max_weight === "number" ? p.max_weight : null) ??
-    999;
-
   return {
-    width: width === 0 ? 999 : width,
-    weight: weight === 0 ? 999 : weight,
+    width: normalizeLimit(p?.max_width_m ?? p?.max_width),
+    weight: normalizeLimit(p?.max_weight_t ?? p?.max_weight),
   };
 }
 
