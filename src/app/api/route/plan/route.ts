@@ -1179,44 +1179,44 @@ export async function POST(req: NextRequest) {
         ? "Route gefunden, aber es gibt blockierende Baustellen. Es wurden Umfahrungen versucht; bitte Warnungen prüfen."
         : null;
 
-        const geojson_alts = altCandidates
-          .filter((c) => c.route?.features?.length)
-          .map((c) => c.route);
+    const geojson_alts = altCandidates
+      .filter((c) => c.route?.features?.length)
+      .map((c) => c.route);
 
-        return NextResponse.json({
-          meta: {
-            source: "route/plan-v21-least-roadworks",
-            status,
-            clean: status === "CLEAN",
-            error: errorMsg,
-            iterations: totalIterations,
-            avoids_applied: best.meta.avoids_applied,
-            bbox_km_used: best.meta.bbox_km,
-            fallback_used: best.meta.fallback_used,
-            phases,
-          },
-          avoid_applied: { total: best.meta.avoids_applied },
-          geojson: best.route,
-          blocking_warnings: best.blockingWarnings,
-          geojson_alts,
-        });
-      } catch (err: any) {
-        return NextResponse.json(
-          {
-            meta: {
-              source: "route/plan-v21-least-roadworks",
-              status: "ERROR",
-              clean: false,
-              error: String(err?.message ?? err ?? "Unbekannter Fehler"),
-            },
-            geojson: {
-              type: "FeatureCollection",
-              features: [],
-            },
-            blocking_warnings: [],
-            geojson_alts: [],
-          },
-          { status: 500 }
-        );
-      }
-    }
+    return NextResponse.json({
+      meta: {
+        source: "route/plan-v21-least-roadworks",
+        status,
+        clean: status === "CLEAN",
+        error: errorMsg,
+        iterations: totalIterations,
+        avoids_applied: best.meta.avoids_applied,
+        bbox_km_used: best.meta.bbox_km,
+        fallback_used: best.meta.fallback_used,
+        phases,
+      },
+      avoid_applied: { total: best.meta.avoids_applied },
+      geojson: best.route,
+      blocking_warnings: best.blockingWarnings,
+      geojson_alts,
+    });
+  } catch (err: any) {
+    return NextResponse.json(
+      {
+        meta: {
+          source: "route/plan-v21-least-roadworks",
+          status: "ERROR",
+          clean: false,
+          error: String(err?.message ?? err ?? "Unbekannter Fehler"),
+        },
+        geojson: {
+          type: "FeatureCollection",
+          features: [],
+        },
+        blocking_warnings: [],
+        geojson_alts: [],
+      },
+      { status: 500 }
+    );
+  }
+}
