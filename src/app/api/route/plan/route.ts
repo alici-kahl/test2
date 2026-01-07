@@ -1204,23 +1204,23 @@ export async function POST(req: NextRequest) {
       geojson_alts,
     }
   );
-  } catch (err: any) {
-    return NextResponse.json(
-      {
-        meta: {
-          source: "route/plan-v21-least-roadworks",
-          status: "ERROR",
-          clean: false,
-          error: String(err?.message ?? err ?? "Unbekannter Fehler"),
-        },
-        geojson: { 
-          type: "FeatureCollection",
-          features: [] 
-        },
-        blocking_warnings: [],
-        geojson_alts: [],
+} catch (err: any) {
+  return NextResponse.json(
+    {
+      meta: {
+        source: "route/plan-v21-least-roadworks",
+        status: "ERROR",
+        clean: false,
+        error: String(err?.message ?? err ?? "Unbekannter Fehler"),
       },
-      { status: 500 }
+      geojson: { 
+        type: "FeatureCollection",
+        features: [] 
+      },
+      blocking_warnings: [],
+      geojson_alts: [],
+    },
+    { status: 500 }
     );
   }
 }
