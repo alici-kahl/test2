@@ -258,23 +258,25 @@ function computeRouteStats(
     roadworksHits++;
 
     const limits = getLimits(obs.properties);
-    if (limits.width < vWidth || limits.weight < vWeight) {
-      let cc: any = null;
-      try {
-        cc = centroid(obs).geometry.coordinates;
-      } catch {
-        cc = null;
-      }
+    const { blocksAny } = blocksVehicle(limits, vWidth, vWeight);
 
-      blockingWarnings.push({
-        title: obs.properties?.title,
-        description: obs.properties?.description,
-        limits,
-        coords: cc,
-        already_avoided: avoidIds ? avoidIds.has(stableObsId(obs)) : false,
-      });
+    if (blocksAny) {
+    let cc: any = null;
+    try {
+      cc = centroid(obs).geometry.coordinates;
+    } catch {
+      cc = null;
     }
-  }
+
+  blockingWarnings.push({
+    title: obs.properties?.title,
+    description: obs.properties?.description,
+    limits,
+    coords: cc,
+    already_avoided: avoidIds ? avoidIds.has(stableObsId(obs)) : false,
+  });
+}
+
 
   return { blockingWarnings, roadworksHits };
 }
