@@ -859,14 +859,9 @@ export async function POST(req: NextRequest) {
           const bumped: Feature<Polygon>[] = [];
           for (const obs of obstacles) {
             const limits = getLimits(obs.properties);
+            const { blocksAny } = blocksVehicle(limits, vWidth, vWeight);
+            if (!blocksAny) continue;
 
-            const blocksWidth =
-              limits.width > 0 && limits.width < vWidth;
-
-            const blocksWeight =
-              limits.weight > 0 && limits.weight < vWeight;
-
-            if (!blocksWidth && !blocksWeight) continue;
 
 
             const id = stableObsId(obs);
