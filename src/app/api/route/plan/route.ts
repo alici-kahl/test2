@@ -1085,25 +1085,17 @@ export async function POST(req: NextRequest) {
           routeBufferPoly = null;
         }
 
-        const blockingObs: Feature<any>[] = [];
-        for (const obs of obstacles) {
-          if (routeBufferPoly && !booleanIntersects(routeBufferPoly as any, obs)) continue;
-          const limits = getLimits(obs.properties);
+        const limits = getLimits(obs.properties);
+        const { blocksAny } = blocksVehicle(limits, vWidth, vWeight);
 
-          const blocksWidth =
-            limits.width > 0 && limits.width < vWidth;
-
-          const blocksWeight =
-            limits.weight > 0 && limits.weight < vWeight;
-
-          if (blocksWidth || blocksWeight) {
-            const id = stableObsId(obs);
-            if (!avoidIds.has(id)) {
-              blockingObs.push(obs);
-              if (blockingObs.length >= MAX_BLOCKING_SCAN) break;
-            }
+        if (blocksAny) {
+          const id = stableObsId(obs);
+          if (!avoidIds.has(id)) {
+            blockingObs.push(obs);
+            if (blockingObs.length >= MAX_BLOCKING_SCAN) break;
           }
         }
+
 
         blockingObs.sort((a, b) => {
           const la = getLimits(a.properties);
