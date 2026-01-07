@@ -1185,7 +1185,8 @@ export async function POST(req: NextRequest) {
       .filter((c) => c.route?.features?.length)
       .map((c) => c.route);
 
-    return NextResponse.json({
+    return NextResponse.json(
+    {
       meta: {
         source: "route/plan-v21-least-roadworks",
         status,
@@ -1201,7 +1202,8 @@ export async function POST(req: NextRequest) {
       geojson: best.route,
       blocking_warnings: best.blockingWarnings,
       geojson_alts,
-    });
+    }
+  );
   } catch (err: any) {
     return NextResponse.json(
       {
@@ -1211,7 +1213,10 @@ export async function POST(req: NextRequest) {
           clean: false,
           error: String(err?.message ?? err ?? "Unbekannter Fehler"),
         },
-        geojson: { type: "FeatureCollection", features: [] },
+        geojson: { 
+          type: "FeatureCollection",
+          features: [] 
+        },
         blocking_warnings: [],
         geojson_alts: [],
       },
