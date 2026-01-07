@@ -1173,13 +1173,15 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const status: "CLEAN" | "WARN" = best.blockingWarnings.length ? "WARN" : "CLEAN";
+    const status: "CLEAN" | "WARN" =
+      best.blockingWarnings.length > 0 ? "WARN" : "CLEAN";
+
     const errorMsg =
       status === "WARN"
         ? "Route gefunden, aber es gibt blockierende Baustellen. Es wurden Umfahrungen versucht; bitte Warnungen prüfen."
         : null;
 
-        const geojson_alts = altCandidates
+    const geojson_alts = altCandidates
       .filter((c) => c.route?.features?.length)
       .map((c) => c.route);
 
