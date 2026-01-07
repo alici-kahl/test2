@@ -799,21 +799,16 @@ export async function POST(req: NextRequest) {
         for (const obs of obstacles) {
           if (routeBufferPoly && !booleanIntersects(routeBufferPoly as any, obs)) continue;
           const limits = getLimits(obs.properties);
+          const { blocksAny } = blocksVehicle(limits, vWidth, vWeight);
 
-          const blocksWidth =
-            limits.width > 0 && limits.width < vWidth;
-
-          const blocksWeight =
-            limits.weight > 0 && limits.weight < vWeight;
-
-          if (blocksWidth || blocksWeight) {
+          if (blocksAny) {
             const id = stableObsId(obs);
             if (!avoidIds.has(id)) {
               blockingObs.push(obs);
               if (blockingObs.length >= MAX_BLOCKING_SCAN) break;
             }
           }
-        }
+
 
         if (blockingObs.length === 0) {
           stuckReason = "Blockierende Baustellen erkannt, aber keine neuen Avoid-Polygone ableitbar.";
