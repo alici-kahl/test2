@@ -55,6 +55,34 @@ function getLimits(p: any) {
   };
 }
 
+function blocksVehicle(
+  limits: { width: number | null; weight: number | null },
+  vWidth: number,
+  vWeight: number
+) {
+  const w = limits.width;
+  const wt = limits.weight;
+
+  const blocksWidth =
+    typeof w === "number" &&
+    Number.isFinite(w) &&
+    w > 0 &&
+    w < vWidth;
+
+  const blocksWeight =
+    typeof wt === "number" &&
+    Number.isFinite(wt) &&
+    wt > 0 &&
+    wt < vWeight;
+
+  return {
+    blocksWidth,
+    blocksWeight,
+    blocksAny: blocksWidth || blocksWeight,
+  };
+}
+
+
 function stableObsId(obs: Feature<any>): string {
   const p: any = obs.properties || {};
   return String(p.roadwork_id ?? p.external_id ?? p.restriction_id ?? p.id ?? JSON.stringify(bboxFn(obs)));
