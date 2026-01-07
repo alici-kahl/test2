@@ -783,12 +783,13 @@ export async function POST(req: NextRequest) {
               if (blockingObs.length >= MAX_BLOCKING_SCAN) break;
             }
           }
-
+        }
 
         if (blockingObs.length === 0) {
           stuckReason = "Blockierende Baustellen erkannt, aber keine neuen Avoid-Polygone ableitbar.";
           break;
         }
+
 
         blockingObs.sort((a, b) => {
           const la = getLimits(a.properties);
