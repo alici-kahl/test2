@@ -506,7 +506,7 @@ export async function POST(req: NextRequest) {
      * Aggressiver suchen, aber Vercel maxDuration=60 respektieren:
      * Wir planen bis ~55s, danach müssen wir raus.
      */
-    const TIME_BUDGET_MS = 55_000;
+    const TIME_BUDGET_MS = 42_000;
     const t0 = Date.now();
     const timeLeft = () => TIME_BUDGET_MS - (Date.now() - t0);
 
@@ -515,10 +515,10 @@ export async function POST(req: NextRequest) {
      * - initial moderat
      * - eskaliert später
      */
-    const baseValhallaTimeout = vWidth >= 3 ? 12_000 : 14_000;
-    const maxValhallaTimeout = 19_000; // minimal erhöht, damit Eskalation real Wirkung hat
+    const baseValhallaTimeout = vWidth >= 3 ? 9_000 : 11_000;
+    const maxValhallaTimeout = 14_000; // enger gedeckelt: verhindert Vercel 60s Timeout (504)
 
-    const ROADWORKS_TIMEOUT_MS = 6_000;
+    const ROADWORKS_TIMEOUT_MS = 4_000;
     const ROUTE_BUFFER_KM = 0.02;
 
     const origin = req.nextUrl.origin;
@@ -982,7 +982,7 @@ export async function POST(req: NextRequest) {
     }
 
     // --- STRICT (kürzere Strecken) ---
-    const BBOX_STEPS_KM = [200, 400, 800, 1400, 2200, 3200];
+    const BBOX_STEPS_KM = IS_WIDE ? [200, 600, 1400, 2200] : [200, 400, 800, 1400, 2200, 3200];
 
     const MAX_ITERATIONS_PER_STEP = IS_WIDE ? 8 : 16;
     const MAX_AVOIDS_TOTAL = Math.min(MAX_AVOIDS_GLOBAL, IS_WIDE ? 110 : 140);
@@ -992,7 +992,7 @@ export async function POST(req: NextRequest) {
     const altCandidates: Candidate[] = [];
 
     for (const bboxKm of BBOX_STEPS_KM) {
-      if (timeLeft() < baseValhallaTimeout + 6_000) break;
+      if (timeLeft() < baseValhallaTimeout + ROADWORKS_TIMEOUT_MS + 4_000) break;
 
       const bbox = makeSafeBBox(start, end, bboxKm);
 
@@ -1021,7 +1021,7 @@ export async function POST(req: NextRequest) {
       let stuckReason: string | null = null;
 
       while (iterations < MAX_ITERATIONS_PER_STEP) {
-        const localTimeout = Math.min(maxValhallaTimeout, baseValhallaTimeout + Math.min(6_000, iterations * 900));
+        const localTimeout = Math.min(maxValhallaTimeout, baseValhallaTimeout + Math.min(3_000, iterations * 600));
         if (timeLeft() < localTimeout + 3_500) {
           stuckReason = "Zeitbudget erreicht (STRICT abgebrochen).";
           break;
