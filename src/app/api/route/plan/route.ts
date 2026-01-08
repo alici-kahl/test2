@@ -55,17 +55,11 @@ function getLimits(p: any) {
   };
 }
 
-function blocksVehicle(
-  limits: { width: number | null; weight: number | null },
-  vWidth: number,
-  vWeight: number
-) {
-  const blocksWidth = typeof limits.width === "number" && limits.width > 0 && limits.width < vWidth;
-  const blocksWeight = typeof limits.weight === "number" && limits.weight > 0 && limits.weight < vWeight;
-  return { blocksWidth, blocksWeight, blocksAny: blocksWidth || blocksWeight };
-}
-
-
+/**
+ * Einheitliche Logik: "blockt dieses Hindernis das Fahrzeug?"
+ * - NULL/0/NaN => keine Aussage => blockt NICHT
+ * - ansonsten: wenn Limit < Fahrzeugwert => blockt
+ */
 function blocksVehicle(
   limits: { width: number | null; weight: number | null },
   vWidth: number,
@@ -74,17 +68,8 @@ function blocksVehicle(
   const w = limits.width;
   const wt = limits.weight;
 
-  const blocksWidth =
-    typeof w === "number" &&
-    Number.isFinite(w) &&
-    w > 0 &&
-    w < vWidth;
-
-  const blocksWeight =
-    typeof wt === "number" &&
-    Number.isFinite(wt) &&
-    wt > 0 &&
-    wt < vWeight;
+  const blocksWidth = typeof w === "number" && Number.isFinite(w) && w > 0 && w < vWidth;
+  const blocksWeight = typeof wt === "number" && Number.isFinite(wt) && wt > 0 && wt < vWeight;
 
   return {
     blocksWidth,
@@ -92,7 +77,6 @@ function blocksVehicle(
     blocksAny: blocksWidth || blocksWeight,
   };
 }
-
 
 function stableObsId(obs: Feature<any>): string {
   const p: any = obs.properties || {};
@@ -298,7 +282,6 @@ function computeRouteStats(
 
     const limits = getLimits(obs.properties);
     const { blocksAny } = blocksVehicle(limits, vWidth, vWeight);
-
     if (!blocksAny) continue;
 
     let cc: any = null;
@@ -319,7 +302,6 @@ function computeRouteStats(
 
   return { blockingWarnings, roadworksHits };
 }
-
 
 type Candidate = {
   route: FeatureCollection;
@@ -361,7 +343,7 @@ function haversineKm(a: Coords, b: Coords) {
   const lat2 = toRad(b[1]);
   const s =
     Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(lat1) * Math.cos(lat2) * (Math.sin(dLon / 2) * Math.sin(dLon / 2));
+    Math.cos(lat1) * Math.cos(lat2) * (Math.sin(dLon / 2) * (Math.sin(dLon / 2)));
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
 }
 
@@ -707,7 +689,9 @@ export async function POST(req: NextRequest) {
               avoids_applied: 0,
               bbox_km_used: null,
               fallback_used: true,
-              phases: phases.concat([{ phase: "FAST_PATH", approx_km: approxKm, result: "NO_ROUTE", reason: res0?.error ?? null }]),
+              phases: phases.concat([
+                { phase: "FAST_PATH", approx_km: approxKm, result: "NO_ROUTE", reason: res0?.error ?? null },
+              ]),
             },
             avoid_applied: { total: 0 },
             geojson: { type: "FeatureCollection", features: [] },
@@ -820,19 +804,18 @@ export async function POST(req: NextRequest) {
               if (blockingObs.length >= MAX_BLOCKING_SCAN) break;
             }
           }
-
+        }
 
         if (blockingObs.length === 0) {
           stuckReason = "Blockierende Baustellen erkannt, aber keine neuen Avoid-Polygone ableitbar.";
           break;
         }
 
-
         blockingObs.sort((a, b) => {
           const la = getLimits(a.properties);
           const lb = getLimits(b.properties);
-          if (la.width !== lb.width) return la.width - lb.width;
-          return la.weight - lb.weight;
+          if (la.width !== lb.width) return (la.width ?? 0) - (lb.width ?? 0);
+          return (la.weight ?? 0) - (lb.weight ?? 0);
         });
 
         let added = 0;
@@ -896,8 +879,6 @@ export async function POST(req: NextRequest) {
             const limits = getLimits(obs.properties);
             const { blocksAny } = blocksVehicle(limits, vWidth, vWeight);
             if (!blocksAny) continue;
-
-
 
             const id = stableObsId(obs);
             if (avoidIds.has(id)) continue;
@@ -1097,23 +1078,27 @@ export async function POST(req: NextRequest) {
           routeBufferPoly = null;
         }
 
-        const limits = getLimits(obs.properties);
-        const { blocksAny } = blocksVehicle(limits, vWidth, vWeight);
+        const blockingObs: Feature<any>[] = [];
+        for (const obs of obstacles) {
+          if (routeBufferPoly && !booleanIntersects(routeBufferPoly as any, obs)) continue;
 
-        if (blocksAny) {
-          const id = stableObsId(obs);
-          if (!avoidIds.has(id)) {
-            blockingObs.push(obs);
-            if (blockingObs.length >= MAX_BLOCKING_SCAN) break;
+          const limits = getLimits(obs.properties);
+          const { blocksAny } = blocksVehicle(limits, vWidth, vWeight);
+
+          if (blocksAny) {
+            const id = stableObsId(obs);
+            if (!avoidIds.has(id)) {
+              blockingObs.push(obs);
+              if (blockingObs.length >= MAX_BLOCKING_SCAN) break;
+            }
           }
         }
-
 
         blockingObs.sort((a, b) => {
           const la = getLimits(a.properties);
           const lb = getLimits(b.properties);
-          if (la.width !== lb.width) return la.width - lb.width;
-          return la.weight - lb.weight;
+          if (la.width !== lb.width) return (la.width ?? 0) - (lb.width ?? 0);
+          return (la.weight ?? 0) - (lb.weight ?? 0);
         });
 
         let added = 0;
@@ -1198,8 +1183,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const status: "CLEAN" | "WARN" =
-      best.blockingWarnings.length > 0 ? "WARN" : "CLEAN";
+    const status: "CLEAN" | "WARN" = best.blockingWarnings.length > 0 ? "WARN" : "CLEAN";
 
     const errorMsg =
       status === "WARN"
@@ -1244,5 +1228,3 @@ export async function POST(req: NextRequest) {
     );
   }
 }
-
-
