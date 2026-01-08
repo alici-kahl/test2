@@ -14,6 +14,8 @@ export const runtime = "nodejs";
 
 type Coords = [number, number];
 
+type BBox = [number, number, number, number];
+
 type PlanReq = {
   start: Coords;
   end: Coords;
@@ -217,12 +219,7 @@ async function callValhalla(
  * Liefert IMMER strukturierte Meta-Daten zurück (ok/status/error),
  * damit Roadworks-Fehler NICHT still als "keine Baustellen" interpretiert werden.
  */
-async function postJSONDetailed<T>(
-  origin: string,
-  path: string,
-  body: any,
-  timeoutMs: number
-): Promise<FetchJSONResult<T>> {
+async function postJSONDetailed<T>(origin: string, path: string, body: any, timeoutMs: number): Promise<FetchJSONResult<T>> {
   const controller = new AbortController();
   const t0 = Date.now();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -324,22 +321,18 @@ function computeRouteStats(
 
   if (!route?.features?.length) return { blockingWarnings, roadworksHits };
 
-  const line = route.features[0];
-
-  let routeBufferPoly: any = null;
-  try {
-    routeBufferPoly = buffer(line as any, routeBufferKm, { units: "kilometers" });
-  } catch {
-    // Wenn Turf buffer auf einer Route-Geometrie mal scheitert, dürfen wir nicht crashen.
-    return { blockingWarnings, roadworksHits };
-  }
+  // Bei sehr langen Routen kann turf.buffer(LineString) sehr teuer werden (CPU) und wirkt wie "Hänger".
+  // Daher nutzen wir ab einer gewissen Geometriegröße einen bbox-basierten Hit-Tester.
+  const coords = getRouteCoords(route);
+  const preferBBox = coords.length > 2200;
+  const tester = makeRouteTester(coords, routeBufferKm, preferBBox);
 
   // Safety: extrem viele Obstacles können sehr teuer werden
   const CAP_SCAN = Math.min(2500, Array.isArray(obstacles) ? obstacles.length : 0);
 
   for (let i = 0; i < CAP_SCAN; i++) {
     const obs = obstacles[i];
-    if (!booleanIntersects(routeBufferPoly, obs)) continue;
+    if (!routeHitsObs(tester, obs)) continue;
 
     roadworksHits++;
 
@@ -408,6 +401,101 @@ function haversineKm(a: Coords, b: Coords) {
     Math.sin(dLat / 2) * Math.sin(dLat / 2) +
     Math.cos(lat1) * Math.cos(lat2) * (Math.sin(dLon / 2) * (Math.sin(dLon / 2)));
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
+}
+
+function isFiniteNumber(n: any): n is number {
+  return typeof n === "number" && Number.isFinite(n);
+}
+
+function normalizeRouteCoords(geometry: any): Coords[] {
+  // Valhalla gibt normalerweise LineString zurück; bei Edge-Cases kann MultiLineString kommen.
+  // Außerdem sichern wir ab, dass alle Koordinaten [lon,lat] sind.
+  const out: Coords[] = [];
+  const push = (c: any) => {
+    if (!Array.isArray(c) || c.length < 2) return;
+    const lon = Number(c[0]);
+    const lat = Number(c[1]);
+    if (!Number.isFinite(lon) || !Number.isFinite(lat)) return;
+    out.push([lon, lat]);
+  };
+
+  const type = geometry?.type;
+  const coords = geometry?.coordinates;
+
+  if (type === "LineString" && Array.isArray(coords)) {
+    for (const c of coords) push(c);
+    return out;
+  }
+  if (type === "MultiLineString" && Array.isArray(coords)) {
+    for (const part of coords) {
+      if (!Array.isArray(part)) continue;
+      for (const c of part) push(c);
+    }
+    return out;
+  }
+
+  return out;
+}
+
+function bboxIntersects(a: BBox, b: BBox): boolean {
+  // a: [minX,minY,maxX,maxY]
+  return !(a[2] < b[0] || a[0] > b[2] || a[3] < b[1] || a[1] > b[3]);
+}
+
+type RouteHitTester =
+  | { mode: "poly"; poly: any }
+  | { mode: "boxes"; boxes: BBox[] };
+
+function makeRouteHitTester(route: FeatureCollection, routeBufferKm: number): RouteHitTester {
+  // TURF buffer auf sehr langen Lines kann CPU-lastig werden und auf Serverless "hängen".
+  // Daher: ab einer Punktzahl schalten wir auf eine sehr schnelle BBox-basierte Approximation um.
+  const geom = (route?.features?.[0] as any)?.geometry;
+  const coords = normalizeRouteCoords(geom);
+
+  const POINTS_THRESHOLD = 2200; // konservativ; verhindert CPU-Spikes bei langen Strecken
+  if (coords.length >= POINTS_THRESHOLD) {
+    const chunkKm = 120;
+    const overlapKm = 30;
+    const expandKm = Math.max(0.25, Math.min(2.0, routeBufferKm * 6));
+    const boxes = chunkRouteToBBoxes(coords, chunkKm, overlapKm, expandKm);
+    return { mode: "boxes", boxes };
+  }
+
+  try {
+    const line = route.features[0];
+    const poly = buffer(line as any, routeBufferKm, { units: "kilometers" });
+    return { mode: "poly", poly };
+  } catch {
+    // Fallback: falls buffer scheitert
+    const chunkKm = 120;
+    const overlapKm = 30;
+    const expandKm = Math.max(0.25, Math.min(2.0, routeBufferKm * 6));
+    const boxes = chunkRouteToBBoxes(coords, chunkKm, overlapKm, expandKm);
+    return { mode: "boxes", boxes };
+  }
+}
+
+function testerHitsObstacle(t: RouteHitTester, obs: Feature<any>): boolean {
+  if (t.mode === "poly") {
+    try {
+      return booleanIntersects(t.poly as any, obs as any);
+    } catch {
+      // wenn booleanIntersects bei kaputter Geometrie wirft => pessimistisch NICHT treffen
+      return false;
+    }
+  }
+
+  // boxes-mode: sehr schnell, aber approximativ (kann false positives liefern; ist hier okay)
+  let ob: BBox | null = null;
+  try {
+    ob = bboxFn(obs as any) as BBox;
+  } catch {
+    return false;
+  }
+  for (const rb of t.boxes) {
+    if (bboxIntersects(rb, ob)) return true;
+  }
+  return false;
 }
 
 function chunkRouteToBBoxes(coords: Coords[], chunkKm: number, overlapKm: number, expandKm: number) {
@@ -746,9 +834,7 @@ export async function POST(req: NextRequest) {
               bbox_km_used: null,
               fallback_used: true,
               roadworks: { status: "SKIPPED" } as RoadworksMeta,
-              phases: phases.concat([
-                { phase: "FAST_PATH", approx_km: approxKm, result: "NO_ROUTE", reason: res0?.error ?? null },
-              ]),
+              phases: phases.concat([{ phase: "FAST_PATH", approx_km: approxKm, result: "NO_ROUTE", reason: res0?.error ?? null }]),
             },
             avoid_applied: { total: 0 },
             geojson: { type: "FeatureCollection", features: [] },
@@ -778,10 +864,7 @@ export async function POST(req: NextRequest) {
         );
       });
 
-      const rwResults = boxes.length
-        ? await runWithConcurrencyLimit(rwTasks, 3)
-        : ([] as FetchJSONResult<{ features: Feature<any>[] }>[]);
-
+      const rwResults = boxes.length ? await runWithConcurrencyLimit(rwTasks, 3) : ([] as FetchJSONResult<{ features: Feature<any>[] }>[]);
       const okResults = rwResults.filter((r) => r.ok && Array.isArray(r.data?.features));
       const failedResults = rwResults.filter((r) => !r.ok);
 
@@ -869,17 +952,14 @@ export async function POST(req: NextRequest) {
 
         totalIterations++;
 
-        const line = best.route.features[0];
-        let routeBufferPoly: any = null;
-        try {
-          routeBufferPoly = buffer(line as any, ROUTE_BUFFER_KM, { units: "kilometers" });
-        } catch {
-          routeBufferPoly = null;
-        }
+        // Wichtig: bei langen Routen NICHT turf.buffer() auf der kompletten LineString-Route machen.
+        // Das ist CPU-intensiv und kann auf Vercel zu Timeouts/Hängern führen.
+        // Wir verwenden daher einen adaptiven Tester.
+        const routeTester = makeRouteTester(best.route, ROUTE_BUFFER_KM);
 
         const blockingObs: Feature<any>[] = [];
         for (const obs of obstacles) {
-          if (routeBufferPoly && !booleanIntersects(routeBufferPoly as any, obs)) continue;
+          if (!routeHitsObs(routeTester, obs)) continue;
           const limits = getLimits(obs.properties);
           const { blocksAny } = blocksVehicle(limits, vWidth, vWeight);
 
@@ -1100,14 +1180,7 @@ export async function POST(req: NextRequest) {
         notes: rwRes.ok ? undefined : `Baustellendaten konnten nicht geladen werden (${rwRes.error ?? "unknown"}).`,
       };
 
-      phases.push({
-        phase: "ROADWORKS_STRICT",
-        bbox_km: bboxKm,
-        ok: rwRes.ok,
-        status: rwRes.status,
-        ms: rwRes.ms,
-        error: rwRes.ok ? null : rwRes.error ?? null,
-      });
+      phases.push({ phase: "ROADWORKS_STRICT", bbox_km: bboxKm, ok: rwRes.ok, status: rwRes.status, ms: rwRes.ms, error: rwRes.ok ? null : rwRes.error ?? null });
 
       const rawObstacles: Feature<any>[] = (rwRes.data?.features ?? []) as Feature<any>[];
 
@@ -1165,17 +1238,12 @@ export async function POST(req: NextRequest) {
           break;
         }
 
-        const line = route.features[0];
-        let routeBufferPoly: any = null;
-        try {
-          routeBufferPoly = buffer(line as any, ROUTE_BUFFER_KM, { units: "kilometers" });
-        } catch {
-          routeBufferPoly = null;
-        }
+        // Analog zum FAST_PATH: bei großen LineStrings buffer() vermeiden (CPU/Timeout-Risiko)
+        const tester = makeRouteTester(route, ROUTE_BUFFER_KM);
 
         const blockingObs: Feature<any>[] = [];
         for (const obs of obstacles) {
-          if (routeBufferPoly && !booleanIntersects(routeBufferPoly as any, obs)) continue;
+          if (!routeHitsObs(tester, obs)) continue;
 
           const limits = getLimits(obs.properties);
           const { blocksAny } = blocksVehicle(limits, vWidth, vWeight);
@@ -1219,15 +1287,7 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      phases.push({
-        phase: "STRICT",
-        bbox_km: bboxKm,
-        iterations,
-        avoids_applied: best?.meta?.avoids_applied ?? 0,
-        result: best?.route?.features?.length ? "CANDIDATE" : "NO_ROUTE",
-        reason: stuckReason,
-        roadworks_status: roadworksMeta.status,
-      });
+      phases.push({ phase: "STRICT", bbox_km: bboxKm, iterations, avoids_applied: best?.meta?.avoids_applied ?? 0, result: best?.route?.features?.length ? "CANDIDATE" : "NO_ROUTE", reason: stuckReason, roadworks_status: roadworksMeta.status });
 
       if (best?.blockingWarnings?.length === 0) break;
     }
