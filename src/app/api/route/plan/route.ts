@@ -159,38 +159,64 @@ function getRouteCoords(route: FeatureCollection): Coords[] {
  * Wir erzeugen IMMER ein Avoid-Rechteck rund um den centroid bzw. bbox-mitte.
  */
 function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon> | null {
-  // Wichtig: Mindestgröße deutlich hoch, sonst ist es bei Autobahn-Works wirkungslos.
-  // 0.6 km ist konservativ, aber realistisch, um Valhalla zu einem echten Reroute zu zwingen.
-  const km = Math.max(0.6, Number.isFinite(bufferKm) ? bufferKm : 0.6);
+  const km = Math.max(0.03, Number.isFinite(bufferKm) ? bufferKm : 0.03);
 
-  let b: [number, number, number, number];
+  // 1) Zentrum bestimmen (centroid) – falls das fehlschlägt, fallback auf bbox-Mitte
+  let lon: number | null = null;
+  let lat: number | null = null;
+
   try {
-    b = bboxFn(f as any) as [number, number, number, number]; // [minLon, minLat, maxLon, maxLat]
+    const c = centroid(f as any);
+    const coords = c?.geometry?.coordinates;
+    if (Array.isArray(coords) && coords.length === 2) {
+      lon = Number(coords[0]);
+      lat = Number(coords[1]);
+    }
   } catch {
-    return null;
+    // noop -> fallback unten
   }
 
-  // bbox-Mitte für die Lon-Grad-Umrechnung
-  const latMid = (b[1] + b[3]) / 2;
-  const latRad = (latMid * Math.PI) / 180;
+  if (lon === null || lat === null || !Number.isFinite(lon) || !Number.isFinite(lat)) {
+    try {
+      const b = bboxFn(f as any) as [number, number, number, number];
+      lon = (b[0] + b[2]) / 2;
+      lat = (b[1] + b[3]) / 2;
+    } catch {
+      return null;
+    }
+  }
 
-  // km -> Grad (stabil genug)
+  // 2) km -> Grad (stabil genug für kleine Rechtecke)
+  const latRad = (lat * Math.PI) / 180;
   const dLat = km / 110.574;
   const cosLat = Math.cos(latRad);
-  const dLon = km / (111.32 * (Math.abs(cosLat) < 1e-6 ? 1 : cosLat));
+  const safeCos = Math.abs(cosLat) < 1e-6 ? 1 : cosLat;
+  const dLon = km / (111.32 * safeCos);
 
-  // bbox erweitern
-  const bb: [number, number, number, number] = [b[0] - dLon, b[1] - dLat, b[2] + dLon, b[3] + dLat];
+  const minLon = lon - dLon;
+  const minLat = lat - dLat;
+  const maxLon = lon + dLon;
+  const maxLat = lat + dLat;
 
-  return polygon([
+  // 3) Polygon mit properties: roadwork_id etc. weiterreichen (hilft beim Debuggen/Tracing)
+  const p: any = (f as any)?.properties ?? {};
+  return polygon(
     [
-      [bb[0], bb[1]],
-      [bb[2], bb[1]],
-      [bb[2], bb[3]],
-      [bb[0], bb[3]],
-      [bb[0], bb[1]],
+      [
+        [minLon, minLat],
+        [maxLon, minLat],
+        [maxLon, maxLat],
+        [minLon, maxLat],
+        [minLon, minLat],
+      ],
     ],
-  ]);
+    {
+      roadwork_id: p.roadwork_id ?? p.external_id ?? p.id ?? null,
+      title: p.title ?? null,
+    }
+  ) as Feature<Polygon>;
+}
+
   
     {
       roadwork_id: p.roadwork_id ?? p.external_id ?? p.id ?? null,
