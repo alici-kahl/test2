@@ -218,6 +218,7 @@ function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon>
 }
 
 
+
 function extractDistanceKm(fc: FeatureCollection): number {
   try {
     const f: any = fc?.features?.[0];
