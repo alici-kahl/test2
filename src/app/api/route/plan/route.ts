@@ -518,24 +518,46 @@ async function callValhalla(
   escape_mode: boolean = false,
   alternates_override?: number
 ) {
+  // Geometry extrahieren (Valhalla erwartet rohe Polygon-Geometrien)
+  const polys = avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined;
+
   const payload = {
     ...reqBody,
-    escape_mode: escape_mode || undefined,
-    alternates: typeof alternates_override === "number" ? alternates_override : reqBody?.alternates,
-    avoid_polygons: avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined,
+
+    // sauber nur setzen, wenn wirklich aktiv
+    escape_mode: escape_mode ? true : undefined,
+
+    alternates:
+      typeof alternates_override === "number"
+        ? alternates_override
+        : reqBody?.alternates,
+
+    /**
+     * WICHTIG:
+     * - manche Valhalla-Setups hören auf avoid_polygons
+     * - andere NUR auf exclude_polygons
+     * → wir senden BEIDES (harmlos, aber maximal kompatibel)
+     */
+    avoid_polygons: polys,
+    exclude_polygons: polys,
   };
 
-  const out = await fetchJSONSafe(`${origin}/api/route/valhalla`, payload, timeoutMs);
+  const out = await fetchJSONSafe(
+    `${origin}/api/route/valhalla`,
+    payload,
+    timeoutMs
+  );
 
   if (out.ok && out.data) return out.data;
 
-  // Valhalla kann auch NON-JSON oder Fehltext liefern -> wir normalisieren
+  // Valhalla kann Text / HTML / Fehler liefern → normalisieren
   return {
     geojson: { type: "FeatureCollection", features: [] },
     error: out.error ? `${out.error} (status=${out.status})` : "VALHALLA_ERROR",
     raw: out.text ? out.text.slice(0, 200) : undefined,
   };
 }
+
 
 /**
  * Precheck-Call (best effort)
