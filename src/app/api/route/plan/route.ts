@@ -161,28 +161,21 @@ function getRouteCoords(route: FeatureCollection): Coords[] {
 function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon> | null {
   const km = Math.max(0.03, Number.isFinite(bufferKm) ? bufferKm : 0.03);
 
-  let c: any;
-  try {
-    c = centroid(f as any);
-  } catch {
-    c = null;
-  }
-
+  // 1) Zentrum bestimmen (centroid) – falls das fehlschlägt, fallback auf bbox-Mitte
   let lon: number | null = null;
   let lat: number | null = null;
 
   try {
+    const c = centroid(f as any);
     const coords = c?.geometry?.coordinates;
     if (Array.isArray(coords) && coords.length === 2) {
       lon = Number(coords[0]);
       lat = Number(coords[1]);
     }
   } catch {
-    lon = null;
-    lat = null;
+    // noop -> fallback unten
   }
 
-  // Fallback: bbox-mitte
   if (lon === null || lat === null || !Number.isFinite(lon) || !Number.isFinite(lat)) {
     try {
       const b = bboxFn(f as any) as [number, number, number, number];
@@ -193,24 +186,37 @@ function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon>
     }
   }
 
-  // km -> Grad (grob, aber stabil)
+  // 2) km -> Grad (stabil genug für kleine Rechtecke)
   const latRad = (lat * Math.PI) / 180;
   const dLat = km / 110.574;
   const cosLat = Math.cos(latRad);
-  const dLon = km / (111.32 * (Math.abs(cosLat) < 1e-6 ? 1 : cosLat));
+  const safeCos = Math.abs(cosLat) < 1e-6 ? 1 : cosLat;
+  const dLon = km / (111.32 * safeCos);
 
-  const b: [number, number, number, number] = [lon - dLon, lat - dLat, lon + dLon, lat + dLat];
+  const minLon = lon - dLon;
+  const minLat = lat - dLat;
+  const maxLon = lon + dLon;
+  const maxLat = lat + dLat;
 
-  return polygon([
+  // 3) Polygon mit properties: roadwork_id etc. weiterreichen (hilft beim Debuggen/Tracing)
+  const p: any = (f as any)?.properties ?? {};
+  return polygon(
     [
-      [b[0], b[1]],
-      [b[2], b[1]],
-      [b[2], b[3]],
-      [b[0], b[3]],
-      [b[0], b[1]],
+      [
+        [minLon, minLat],
+        [maxLon, minLat],
+        [maxLon, maxLat],
+        [minLon, maxLat],
+        [minLon, minLat],
+      ],
     ],
-  ]);
+    {
+      roadwork_id: p.roadwork_id ?? p.external_id ?? p.id ?? null,
+      title: p.title ?? null,
+    }
+  ) as Feature<Polygon>;
 }
+
 
 function extractDistanceKm(fc: FeatureCollection): number {
   try {
