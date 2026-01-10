@@ -158,33 +158,28 @@ function getRouteCoords(route: FeatureCollection): Coords[] {
  * Robust: Avoid-Polygon um eine Baustelle.
  * Wir erzeugen IMMER ein Avoid-Rechteck rund um den centroid bzw. bbox-mitte.
  */
-function createAvoidPolygon(
-  f: Feature<any>,
-  bufferKm: number
-): Feature<Polygon> | null {
-  // Valhalla-magische Untergrenze: < 30 m wird oft ignoriert
-  const km = Math.max(0.05, Number.isFinite(bufferKm) ? bufferKm : 0.05);
+function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon> | null {
+  const km = Math.max(0.03, Number.isFinite(bufferKm) ? bufferKm : 0.03);
 
+  // Properties optional fürs Debugging
+  const p: any = (f as any)?.properties ?? {};
+
+  // 1) Zentrum bestimmen (centroid) – falls das fehlschlägt, fallback auf bbox-Mitte
   let lon: number | null = null;
   let lat: number | null = null;
 
-  // 1) centroid versuchen
   try {
     const c = centroid(f as any);
     const coords = c?.geometry?.coordinates;
-    if (
-      Array.isArray(coords) &&
-      coords.length === 2 &&
-      Number.isFinite(coords[0]) &&
-      Number.isFinite(coords[1])
-    ) {
-      lon = coords[0];
-      lat = coords[1];
+    if (Array.isArray(coords) && coords.length === 2) {
+      lon = Number(coords[0]);
+      lat = Number(coords[1]);
     }
-  } catch {}
+  } catch {
+    // noop -> fallback unten
+  }
 
-  // 2) Fallback: bbox-Mitte (SEHR wichtig für LineStrings)
-  if (lon === null || lat === null) {
+  if (lon === null || lat === null || !Number.isFinite(lon) || !Number.isFinite(lat)) {
     try {
       const b = bboxFn(f as any) as [number, number, number, number];
       lon = (b[0] + b[2]) / 2;
@@ -194,30 +189,35 @@ function createAvoidPolygon(
     }
   }
 
-  if (!Number.isFinite(lon) || !Number.isFinite(lat)) return null;
-
-  // 3) km → Grad (stabil, nicht exakt, aber korrekt genug)
+  // 2) km -> Grad (grob, aber stabil)
   const latRad = (lat * Math.PI) / 180;
   const dLat = km / 110.574;
   const cosLat = Math.cos(latRad);
   const dLon = km / (111.32 * (Math.abs(cosLat) < 1e-6 ? 1 : cosLat));
 
-  // 4) Rechteck-POLYGON (Valhalla mag KEINE Buffer-Geometrien)
   const minLon = lon - dLon;
   const maxLon = lon + dLon;
   const minLat = lat - dLat;
   const maxLat = lat + dLat;
 
-  return polygon([
+  // 3) Polygon erzeugen (Turf polygon gibt bereits Feature<Polygon> zurück – kein "as Feature<...>" nötig)
+  return polygon(
     [
-      [minLon, minLat],
-      [maxLon, minLat],
-      [maxLon, maxLat],
-      [minLon, maxLat],
-      [minLon, minLat],
+      [
+        [minLon, minLat],
+        [maxLon, minLat],
+        [maxLon, maxLat],
+        [minLon, maxLat],
+        [minLon, minLat],
+      ],
     ],
-  ]);
+    {
+      roadwork_id: p.roadwork_id ?? p.external_id ?? p.id ?? null,
+      title: p.title ?? null,
+    }
+  );
 }
+
 
 
   // 2) km -> Grad (stabil genug für kleine Rechtecke)
