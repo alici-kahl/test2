@@ -9,7 +9,7 @@ import { lineString, polygon, Feature, FeatureCollection, Polygon } from "@turf/
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-// WICHTIG: sicherstellen, dass das NICHT als Edge-Route läuft (Edge hat andere Limits/Verhalten)
+// WICHTIG: sicherstellen, dass das NICHT als Edge-Route läuft
 export const runtime = "nodejs";
 
 type Coords = [number, number];
@@ -27,11 +27,6 @@ type PlanReq = {
   avoid_target_max?: number;
   valhalla_soft_max?: number;
   respect_direction?: boolean;
-
-  /**
-   * Wenn true, wird NUR eine CLEAN-Route akzeptiert (keine blockierenden Baustellen).
-   * Wenn nach allen Versuchen keine CLEAN-Route gefunden wird => status=BLOCKED und geojson leer.
-   */
   require_clean?: boolean;
 };
 
@@ -77,23 +72,10 @@ function getLimits(p: any) {
   };
 }
 
-/**
- * Einheitliche Logik: "blockt dieses Hindernis das Fahrzeug?"
- * - NULL/0/NaN => keine Aussage => blockt NICHT
- * - ansonsten: wenn Limit < Fahrzeugwert => blockt
- */
 function blocksVehicle(limits: { width: number | null; weight: number | null }, vWidth: number, vWeight: number) {
-  const w = limits.width;
-  const wt = limits.weight;
-
-  const blocksWidth = typeof w === "number" && Number.isFinite(w) && w > 0 && w < vWidth;
-  const blocksWeight = typeof wt === "number" && Number.isFinite(wt) && wt > 0 && wt < vWeight;
-
-  return {
-    blocksWidth,
-    blocksWeight,
-    blocksAny: blocksWidth || blocksWeight,
-  };
+  const blocksWidth = typeof limits.width === "number" && limits.width < vWidth;
+  const blocksWeight = typeof limits.weight === "number" && limits.weight < vWeight;
+  return { blocksWidth, blocksWeight, blocksAny: blocksWidth || blocksWeight };
 }
 
 function stableObsId(obs: Feature<any>): string {
@@ -102,69 +84,13 @@ function stableObsId(obs: Feature<any>): string {
 }
 
 /**
- * FIX: aus Route GeoJSON sicher Koordinaten holen
- * (behebt: "getRouteCoords is not defined" + defensive parsing)
- *
- * Unterstützt:
- * - FeatureCollection mit 1 Feature (LineString/MultiLineString)
- * - direkte Koordinaten in geometry.coordinates
- * - GeometryCollection (nimmt erstes LineString)
- *
- * Wichtig: Diese Funktion MUSS oberhalb von POST stehen, sonst kann Next/Node zur Laufzeit "undefined" sehen.
- */
-function getRouteCoords(route: FeatureCollection): Coords[] {
-  try {
-    const f: any = route?.features?.[0];
-    const g: any = f?.geometry;
-
-    const toCoords = (arr: any): Coords[] => {
-      if (!Array.isArray(arr)) return [];
-      // LineString => [ [lon,lat], ...]
-      if (arr.length && Array.isArray(arr[0]) && arr[0].length === 2 && typeof arr[0][0] === "number") {
-        return arr as Coords[];
-      }
-      return [];
-    };
-
-    if (!g) return [];
-    if (g.type === "LineString") return toCoords(g.coordinates);
-    if (g.type === "MultiLineString") {
-      // flach machen (erste Linie reicht für Sampling/Chunking; ansonsten concat)
-      const lines: any[] = Array.isArray(g.coordinates) ? g.coordinates : [];
-      const out: Coords[] = [];
-      for (const line of lines) out.push(...toCoords(line));
-      return out;
-    }
-    if (g.type === "GeometryCollection") {
-      const geoms: any[] = Array.isArray(g.geometries) ? g.geometries : [];
-      for (const gg of geoms) {
-        if (gg?.type === "LineString") return toCoords(gg.coordinates);
-        if (gg?.type === "MultiLineString") {
-          const lines: any[] = Array.isArray(gg.coordinates) ? gg.coordinates : [];
-          const out: Coords[] = [];
-          for (const line of lines) out.push(...toCoords(line));
-          return out;
-        }
-      }
-      return [];
-    }
-    return [];
-  } catch {
-    return [];
-  }
-}
-
-/**
  * Robust: Avoid-Polygon um eine Baustelle.
- * Wir erzeugen IMMER ein Avoid-Rechteck rund um den centroid bzw. bbox-mitte.
+ * Wir erzeugen IMMER ein Avoid-Rechteck rund um centroid bzw. bbox-Mitte.
  */
 function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon> | null {
   const km = Math.max(0.03, Number.isFinite(bufferKm) ? bufferKm : 0.03);
-
-  // Properties optional fürs Debugging
   const p: any = (f as any)?.properties ?? {};
 
-  // 1) Zentrum bestimmen (centroid) – falls das fehlschlägt, fallback auf bbox-Mitte
   let lon: number | null = null;
   let lat: number | null = null;
 
@@ -175,9 +101,7 @@ function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon>
       lon = Number(coords[0]);
       lat = Number(coords[1]);
     }
-  } catch {
-    // noop -> fallback unten
-  }
+  } catch {}
 
   if (lon === null || lat === null || !Number.isFinite(lon) || !Number.isFinite(lat)) {
     try {
@@ -189,18 +113,16 @@ function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon>
     }
   }
 
-  // 2) km -> Grad (grob, aber stabil)
   const latRad = (lat * Math.PI) / 180;
   const dLat = km / 110.574;
   const cosLat = Math.cos(latRad);
   const dLon = km / (111.32 * (Math.abs(cosLat) < 1e-6 ? 1 : cosLat));
 
   const minLon = lon - dLon;
-  const maxLon = lon + dLon;
   const minLat = lat - dLat;
+  const maxLon = lon + dLon;
   const maxLat = lat + dLat;
 
-  // 3) Polygon erzeugen (Turf polygon gibt bereits Feature<Polygon> zurück – kein "as Feature<...>" nötig)
   return polygon(
     [
       [
@@ -217,6 +139,7 @@ function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon>
     }
   );
 }
+
 
 
 
