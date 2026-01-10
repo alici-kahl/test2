@@ -191,7 +191,7 @@ function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon>
       [bb[0], bb[1]],
     ],
   ]);
-}
+  
     {
       roadwork_id: p.roadwork_id ?? p.external_id ?? p.id ?? null,
       title: p.title ?? null,
