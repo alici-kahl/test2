@@ -73,8 +73,12 @@ function getLimits(p: any) {
 }
 
 function blocksVehicle(limits: { width: number | null; weight: number | null }, vWidth: number, vWeight: number) {
-  const blocksWidth = typeof limits.width === "number" && limits.width < vWidth;
-  const blocksWeight = typeof limits.weight === "number" && limits.weight < vWeight;
+  const w = limits.width;
+  const wt = limits.weight;
+
+  const blocksWidth = typeof w === "number" && Number.isFinite(w) && w > 0 && w < vWidth;
+  const blocksWeight = typeof wt === "number" && Number.isFinite(wt) && wt > 0 && wt < vWeight;
+
   return { blocksWidth, blocksWeight, blocksAny: blocksWidth || blocksWeight };
 }
 
@@ -86,6 +90,8 @@ function stableObsId(obs: Feature<any>): string {
 /**
  * Robust: Avoid-Polygon um eine Baustelle.
  * Wir erzeugen IMMER ein Avoid-Rechteck rund um centroid bzw. bbox-Mitte.
+ *
+ * WICHTIG: In deiner Datei MUSS nach dieser Funktion KEIN "loser" zusätzlicher Code mehr folgen.
  */
 function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon> | null {
   const km = Math.max(0.03, Number.isFinite(bufferKm) ? bufferKm : 0.03);
@@ -94,6 +100,7 @@ function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon>
   let lon: number | null = null;
   let lat: number | null = null;
 
+  // 1) centroid versuchen
   try {
     const c = centroid(f as any);
     const coords = c?.geometry?.coordinates;
@@ -101,8 +108,11 @@ function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon>
       lon = Number(coords[0]);
       lat = Number(coords[1]);
     }
-  } catch {}
+  } catch {
+    // noop
+  }
 
+  // 2) fallback bbox-mitte
   if (lon === null || lat === null || !Number.isFinite(lon) || !Number.isFinite(lat)) {
     try {
       const b = bboxFn(f as any) as [number, number, number, number];
@@ -113,16 +123,19 @@ function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon>
     }
   }
 
+  // 3) km -> Grad
   const latRad = (lat * Math.PI) / 180;
   const dLat = km / 110.574;
   const cosLat = Math.cos(latRad);
-  const dLon = km / (111.32 * (Math.abs(cosLat) < 1e-6 ? 1 : cosLat));
+  const safeCos = Math.abs(cosLat) < 1e-6 ? 1 : cosLat;
+  const dLon = km / (111.32 * safeCos);
 
   const minLon = lon - dLon;
   const minLat = lat - dLat;
   const maxLon = lon + dLon;
   const maxLat = lat + dLat;
 
+  // 4) Rechteck-Polygon
   return polygon(
     [
       [
@@ -139,6 +152,7 @@ function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon>
     }
   );
 }
+
 
 
 
