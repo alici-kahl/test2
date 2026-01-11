@@ -17,13 +17,7 @@ type Coords = [number, number];
 type PlanReq = {
   start: Coords;
   end: Coords;
-  vehicle?: {
-    width_m?: number;
-    height_m?: number;
-    weight_t?: number;
-    axleload_t?: number;
-    hazmat?: boolean;
-  };
+  vehicle?: { width_m?: number; height_m?: number; weight_t?: number; axleload_t?: number; hazmat?: boolean };
   ts?: string;
   tz?: string;
   corridor?: { width_m?: number };
@@ -109,10 +103,13 @@ function stableObsId(obs: Feature<any>): string {
 
 /**
  * FIX: aus Route GeoJSON sicher Koordinaten holen
+ * (behebt: defensive parsing)
  *
  * Unterstützt:
  * - FeatureCollection mit 1 Feature (LineString/MultiLineString)
  * - GeometryCollection (nimmt erstes LineString)
+ *
+ * Wichtig: Diese Funktion MUSS oberhalb von POST stehen, sonst kann Next/Node zur Laufzeit "undefined" sehen.
  */
 function getRouteCoords(route: FeatureCollection): Coords[] {
   try {
@@ -197,7 +194,10 @@ function bboxToBufferedRectPoly(b: [number, number, number, number], bufferKm: n
 
 /**
  * Robust: Avoid-Polygon um eine Baustelle.
- * - Wir nutzen die Feature-BBOX (i.d.R. das Sperrsegment) und puffern diese.
+ *
+ * WICHTIGER FIX ggü. deiner bisherigen Logik:
+ * - Centroid-Quadrat ist bei Autobahn-Sperrungen fast immer zu klein.
+ * - Wir nutzen die Feature-BBOX (die i.d.R. das Sperrsegment abdeckt) und puffern diese.
  */
 function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon> | null {
   try {
@@ -347,110 +347,6 @@ function haversineKm(a: Coords, b: Coords) {
     Math.cos(lat1) * Math.cos(lat2) * (Math.sin(dLon / 2) * (Math.sin(dLon / 2)));
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
 }
-
-/**
- * fetchJSONSafe:
- * - liefert IMMER zurück (kein throw)
- * - erkennt Nicht-JSON (z.B. Vercel 504 HTML/Text) sauber
- */
-async function fetchJSONSafe(
-  url: string,
-  body: any,
-  timeoutMs: number
-): Promise<{ ok: boolean; status: number; data: any | null; text: string; error?: string }> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-      cache: "no-store",
-    });
-
-    const status = res.status;
-    const text = await res.text().catch(() => "");
-
-    let parsed: any | null = null;
-    if (text) {
-      try {
-        parsed = JSON.parse(text);
-      } catch {
-        parsed = null;
-      }
-    }
-
-    if (!parsed) {
-      return {
-        ok: false,
-        status,
-        data: null,
-        text,
-        error: res.ok ? "NON_JSON_RESPONSE" : "HTTP_ERROR_NON_JSON",
-      };
-    }
-
-    return { ok: res.ok, status, data: parsed, text };
-  } catch (e: any) {
-    const msg = String(e?.message ?? e ?? "");
-    const isAbort = e?.name === "AbortError" || msg.toLowerCase().includes("abort");
-    return {
-      ok: false,
-      status: 0,
-      data: null,
-      text: "",
-      error: isAbort ? "ABORT_TIMEOUT" : `FETCH_FAILED:${msg}`,
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
- * callValhalla:
- * - escape_mode an /api/route/valhalla weiterreichen
- * - alternates optional überschreiben
- * - FIX: NUR exclude_polygons senden (avoid_polygons NICHT mitsenden)
- */
-async function callValhalla(
-  origin: string,
-  reqBody: any,
-  avoidPolys: Feature<Polygon>[],
-  timeoutMs: number,
-  escape_mode: boolean = false,
-  alternates_override?: number
-) {
-  // Valhalla erwartet rohe Polygon-Geometrien
-  const polys = avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined;
-
-  const payload = {
-    ...reqBody,
-    escape_mode: escape_mode ? true : undefined,
-    alternates: typeof alternates_override === "number" ? alternates_override : reqBody?.alternates,
-
-    /**
-     * FIX:
-     * Nicht avoid_polygons + exclude_polygons mischen.
-     * Dein /api/route/valhalla normalisiert bereits auf avoid_polygons.
-     * Wenn du hier beides schickst, kannst du (je nach Setup) “soft avoid” Verhalten bekommen.
-     * -> Nur exclude_polygons = harte Sperre.
-     */
-    exclude_polygons: polys,
-  };
-
-  const out = await fetchJSONSafe(`${origin}/api/route/valhalla`, payload, timeoutMs);
-
-  if (out.ok && out.data) return out.data;
-
-  return {
-    geojson: { type: "FeatureCollection", features: [] },
-    error: out.error ? `${out.error} (status=${out.status})` : "VALHALLA_ERROR",
-    raw: out.text ? out.text.slice(0, 200) : undefined,
-  };
-}
-
 
 function chunkRouteToBBoxes(coords: Coords[], chunkKm: number, overlapKm: number, expandKm: number) {
   if (!Array.isArray(coords) || coords.length < 2) return [] as [number, number, number, number][];
