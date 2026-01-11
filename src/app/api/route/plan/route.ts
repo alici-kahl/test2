@@ -1,4 +1,7 @@
-// src/app/api/route/plan/route.ts
+// =======================
+// TEIL 1/2 (Start → inkl. createAvoidPolygon)
+// Datei: src/app/api/route/plan/route.ts
+// =======================
 import { NextRequest, NextResponse } from "next/server";
 import bboxFn from "@turf/bbox";
 import buffer from "@turf/buffer";
@@ -9,7 +12,7 @@ import { lineString, polygon, Feature, FeatureCollection, Polygon } from "@turf/
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-// WICHTIG: sicherstellen, dass das NICHT als Edge-Route läuft
+// WICHTIG: sicherstellen, dass das NICHT als Edge-Route läuft (Edge hat andere Limits/Verhalten)
 export const runtime = "nodejs";
 
 type Coords = [number, number];
@@ -27,6 +30,11 @@ type PlanReq = {
   avoid_target_max?: number;
   valhalla_soft_max?: number;
   respect_direction?: boolean;
+
+  /**
+   * Wenn true, wird NUR eine CLEAN-Route akzeptiert (keine blockierenden Baustellen).
+   * Wenn nach allen Versuchen keine CLEAN-Route gefunden wird => status=BLOCKED und geojson leer.
+   */
   require_clean?: boolean;
 };
 
@@ -72,6 +80,11 @@ function getLimits(p: any) {
   };
 }
 
+/**
+ * Einheitliche Logik: "blockt dieses Hindernis das Fahrzeug?"
+ * - NULL/0/NaN => keine Aussage => blockt NICHT
+ * - ansonsten: wenn Limit < Fahrzeugwert => blockt
+ */
 function blocksVehicle(limits: { width: number | null; weight: number | null }, vWidth: number, vWeight: number) {
   const w = limits.width;
   const wt = limits.weight;
@@ -79,7 +92,11 @@ function blocksVehicle(limits: { width: number | null; weight: number | null }, 
   const blocksWidth = typeof w === "number" && Number.isFinite(w) && w > 0 && w < vWidth;
   const blocksWeight = typeof wt === "number" && Number.isFinite(wt) && wt > 0 && wt < vWeight;
 
-  return { blocksWidth, blocksWeight, blocksAny: blocksWidth || blocksWeight };
+  return {
+    blocksWidth,
+    blocksWeight,
+    blocksAny: blocksWidth || blocksWeight,
+  };
 }
 
 function stableObsId(obs: Feature<any>): string {
@@ -88,19 +105,75 @@ function stableObsId(obs: Feature<any>): string {
 }
 
 /**
- * Robust: Avoid-Polygon um eine Baustelle.
- * Wir erzeugen IMMER ein Avoid-Rechteck rund um centroid bzw. bbox-Mitte.
+ * FIX: aus Route GeoJSON sicher Koordinaten holen
+ * (behebt: "getRouteCoords is not defined" + defensive parsing)
  *
- * WICHTIG: In deiner Datei MUSS nach dieser Funktion KEIN "loser" zusätzlicher Code mehr folgen.
+ * Unterstützt:
+ * - FeatureCollection mit 1 Feature (LineString/MultiLineString)
+ * - direkte Koordinaten in geometry.coordinates
+ * - GeometryCollection (nimmt erstes LineString)
+ *
+ * Wichtig: Diese Funktion MUSS oberhalb von POST stehen, sonst kann Next/Node zur Laufzeit "undefined" sehen.
+ */
+function getRouteCoords(route: FeatureCollection): Coords[] {
+  try {
+    const f: any = route?.features?.[0];
+    const g: any = f?.geometry;
+
+    const toCoords = (arr: any): Coords[] => {
+      if (!Array.isArray(arr)) return [];
+      // LineString => [ [lon,lat], ...]
+      if (arr.length && Array.isArray(arr[0]) && arr[0].length === 2 && typeof arr[0][0] === "number") {
+        return arr as Coords[];
+      }
+      return [];
+    };
+
+    if (!g) return [];
+    if (g.type === "LineString") return toCoords(g.coordinates);
+    if (g.type === "MultiLineString") {
+      // flach machen (erste Linie reicht für Sampling/Chunking; ansonsten concat)
+      const lines: any[] = Array.isArray(g.coordinates) ? g.coordinates : [];
+      const out: Coords[] = [];
+      for (const line of lines) out.push(...toCoords(line));
+      return out;
+    }
+    if (g.type === "GeometryCollection") {
+      const geoms: any[] = Array.isArray(g.geometries) ? g.geometries : [];
+      for (const gg of geoms) {
+        if (gg?.type === "LineString") return toCoords(gg.coordinates);
+        if (gg?.type === "MultiLineString") {
+          const lines: any[] = Array.isArray(gg.coordinates) ? gg.coordinates : [];
+          const out: Coords[] = [];
+          for (const line of lines) out.push(...toCoords(line));
+          return out;
+        }
+      }
+      return [];
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Robust: Avoid-Polygon um eine Baustelle.
+ * Wir erzeugen IMMER ein Avoid-Rechteck rund um den centroid bzw. bbox-mitte.
+ *
+ * WICHTIG: Diese Funktion darf nur EINMAL existieren.
+ * Keine doppelten/losen Codeblöcke danach (sonst TS kaputt / Build instabil).
  */
 function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon> | null {
   const km = Math.max(0.03, Number.isFinite(bufferKm) ? bufferKm : 0.03);
+
+  // Properties optional fürs Debugging/Tracing
   const p: any = (f as any)?.properties ?? {};
 
+  // 1) Zentrum bestimmen (centroid) – falls das fehlschlägt, fallback auf bbox-Mitte
   let lon: number | null = null;
   let lat: number | null = null;
 
-  // 1) centroid versuchen
   try {
     const c = centroid(f as any);
     const coords = c?.geometry?.coordinates;
@@ -109,10 +182,9 @@ function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon>
       lat = Number(coords[1]);
     }
   } catch {
-    // noop
+    // noop -> fallback unten
   }
 
-  // 2) fallback bbox-mitte
   if (lon === null || lat === null || !Number.isFinite(lon) || !Number.isFinite(lat)) {
     try {
       const b = bboxFn(f as any) as [number, number, number, number];
@@ -123,19 +195,18 @@ function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon>
     }
   }
 
-  // 3) km -> Grad
+  // 2) km -> Grad (grob, aber stabil)
   const latRad = (lat * Math.PI) / 180;
   const dLat = km / 110.574;
   const cosLat = Math.cos(latRad);
-  const safeCos = Math.abs(cosLat) < 1e-6 ? 1 : cosLat;
-  const dLon = km / (111.32 * safeCos);
+  const dLon = km / (111.32 * (Math.abs(cosLat) < 1e-6 ? 1 : cosLat));
 
   const minLon = lon - dLon;
-  const minLat = lat - dLat;
   const maxLon = lon + dLon;
+  const minLat = lat - dLat;
   const maxLat = lat + dLat;
 
-  // 4) Rechteck-Polygon
+  // 3) Polygon erzeugen (Turf polygon gibt Feature<Polygon> zurück)
   return polygon(
     [
       [
@@ -154,41 +225,10 @@ function createAvoidPolygon(f: Feature<any>, bufferKm: number): Feature<Polygon>
 }
 
 
-
-
-
-  // 2) km -> Grad (stabil genug für kleine Rechtecke)
-  const latRad = (lat * Math.PI) / 180;
-  const dLat = km / 110.574;
-  const cosLat = Math.cos(latRad);
-  const safeCos = Math.abs(cosLat) < 1e-6 ? 1 : cosLat;
-  const dLon = km / (111.32 * safeCos);
-
-  const minLon = lon - dLon;
-  const minLat = lat - dLat;
-  const maxLon = lon + dLon;
-  const maxLat = lat + dLat;
-
-  // 3) Polygon mit properties: roadwork_id etc. weiterreichen (hilft beim Debuggen/Tracing)
-  const p: any = (f as any)?.properties ?? {};
-  return polygon(
-    [
-      [
-        [minLon, minLat],
-        [maxLon, minLat],
-        [maxLon, maxLat],
-        [minLon, maxLat],
-        [minLon, minLat],
-      ],
-    ],
-    {
-      roadwork_id: p.roadwork_id ?? p.external_id ?? p.id ?? null,
-      title: p.title ?? null,
-    }
-  ) as Feature<Polygon>;
-}
-
-
+// =======================
+// TEIL 2/2 (ab extractDistanceKm → Ende)
+// Datei: src/app/api/route/plan/route.ts
+// =======================
 
 function extractDistanceKm(fc: FeatureCollection): number {
   try {
@@ -439,7 +479,6 @@ async function fetchJSONSafe(
     const status = res.status;
     const text = await res.text().catch(() => "");
 
-    // Wenn nicht ok: trotzdem text zurückgeben, aber data kann null bleiben
     let parsed: any | null = null;
     if (text) {
       try {
@@ -498,10 +537,7 @@ async function callValhalla(
     // sauber nur setzen, wenn wirklich aktiv
     escape_mode: escape_mode ? true : undefined,
 
-    alternates:
-      typeof alternates_override === "number"
-        ? alternates_override
-        : reqBody?.alternates,
+    alternates: typeof alternates_override === "number" ? alternates_override : reqBody?.alternates,
 
     /**
      * WICHTIG:
@@ -513,22 +549,16 @@ async function callValhalla(
     exclude_polygons: polys,
   };
 
-  const out = await fetchJSONSafe(
-    `${origin}/api/route/valhalla`,
-    payload,
-    timeoutMs
-  );
+  const out = await fetchJSONSafe(`${origin}/api/route/valhalla`, payload, timeoutMs);
 
   if (out.ok && out.data) return out.data;
 
-  // Valhalla kann Text / HTML / Fehler liefern → normalisieren
   return {
     geojson: { type: "FeatureCollection", features: [] },
     error: out.error ? `${out.error} (status=${out.status})` : "VALHALLA_ERROR",
     raw: out.text ? out.text.slice(0, 200) : undefined,
   };
 }
-
 
 /**
  * Precheck-Call (best effort)
@@ -537,7 +567,10 @@ async function callPrecheck(origin: string, payload: any, timeoutMs: number) {
   const out = await fetchJSONSafe(`${origin}/api/route/precheck`, payload, timeoutMs);
 
   if (out.ok && out.data) return { ok: true, data: out.data };
-  return { ok: false, data: out.data ?? { status: "WARN", error: out.error ?? "PRECHECK_FAILED", raw: out.text?.slice?.(0, 200) } };
+  return {
+    ok: false,
+    data: out.data ?? { status: "WARN", error: out.error ?? "PRECHECK_FAILED", raw: out.text?.slice?.(0, 200) },
+  };
 }
 
 /**
@@ -549,7 +582,6 @@ async function callRoadworks(
   body: any,
   timeoutMs: number
 ): Promise<{ ok: boolean; features: Feature<any>[]; meta?: any; error?: string; status: number }> {
-  // /api/roadworks akzeptiert timeout_ms (dein Code)
   const payload = { ...body, timeout_ms: timeoutMs };
 
   const out = await fetchJSONSafe(`${origin}/api/roadworks`, payload, timeoutMs);
@@ -560,8 +592,6 @@ async function callRoadworks(
     return { ok: true, features: feats, meta: fc?.meta, status: out.status };
   }
 
-  // Auch wenn HTTP 200 aber NON-JSON: ok=false
-  // Features bleiben leer, damit Planner FAIL-OPEN bleibt.
   return { ok: false, features: [], error: out.error ?? "ROADWORKS_FAILED", status: out.status };
 }
 
@@ -624,7 +654,10 @@ export async function POST(req: NextRequest) {
 
     // Roadworks Timeout: 4s ist zu knapp bei Hobby + Supabase RPC.
     // -> erhöhen, aber deckeln.
-    const ROADWORKS_TIMEOUT_MS = Math.min(7_500, Math.max(5_500, Number(body?.roadworks?.buffer_m ?? 60) >= 60 ? 6_500 : 6_000));
+    const ROADWORKS_TIMEOUT_MS = Math.min(
+      7_500,
+      Math.max(5_500, Number(body?.roadworks?.buffer_m ?? 60) >= 60 ? 6_500 : 6_000)
+    );
 
     const ROUTE_BUFFER_KM = 0.02;
     const origin = req.nextUrl.origin;
@@ -682,7 +715,8 @@ export async function POST(req: NextRequest) {
               source: "route/plan-stable-v1",
               status: "BLOCKED",
               clean: false,
-              error: "Precheck: Korridor ist grundsätzlich nicht befahrbar (require_clean=true). Routing wurde nicht gestartet.",
+              error:
+                "Precheck: Korridor ist grundsätzlich nicht befahrbar (require_clean=true). Routing wurde nicht gestartet.",
               iterations: totalIterations,
               avoids_applied: 0,
               bbox_km_used: null,
@@ -785,7 +819,9 @@ export async function POST(req: NextRequest) {
             avoids_applied: 0,
             bbox_km_used: null,
             fallback_used: true,
-            phases: phases.concat([{ phase: "FAST_PATH", approx_km: approxKm, result: "NO_ROUTE", reason: res0?.error ?? null }]),
+            phases: phases.concat([
+              { phase: "FAST_PATH", approx_km: approxKm, result: "NO_ROUTE", reason: res0?.error ?? null },
+            ]),
           },
           roadworks: { ...rwTelemetry, status: "SKIPPED", notes: "no_route_fast_path" },
           avoid_applied: { total: 0 },
@@ -815,16 +851,15 @@ export async function POST(req: NextRequest) {
       let obstacles: Feature<any>[] = [];
 
       if (boxes.length && timeLeft() > 2_000) {
-        const perCallTimeout = Math.min(ROADWORKS_TIMEOUT_MS, Math.max(4_800, Math.floor(timeLeft() / (boxes.length + 1))));
+        const perCallTimeout = Math.min(
+          ROADWORKS_TIMEOUT_MS,
+          Math.max(4_800, Math.floor(timeLeft() / (boxes.length + 1)))
+        );
         rwTelemetry.timeout_ms = perCallTimeout;
 
         const results = await Promise.all(
           boxes.map((bb) =>
-            callRoadworks(
-              origin,
-              { ts, tz, bbox: bb, buffer_m: roadworksBufferM, only_motorways: onlyMotorways },
-              perCallTimeout
-            )
+            callRoadworks(origin, { ts, tz, bbox: bb, buffer_m: roadworksBufferM, only_motorways: onlyMotorways }, perCallTimeout)
           )
         );
 
@@ -875,7 +910,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({
           meta: {
             source: "route/plan-stable-v1",
-            status: "CLEAN", // Route sauber im Sinne: "route exists"; Baustellenstatus ist separat ausgewiesen
+            status: "CLEAN",
             clean: true,
             error: null,
             iterations: totalIterations,
@@ -1051,9 +1086,6 @@ export async function POST(req: NextRequest) {
     let best: Candidate | null = null;
     const altCandidates: Candidate[] = [];
 
-    // Für STRICT: Roadworks werden je BBOX versucht (best effort).
-    // Wenn Roadworks komplett fehlschlagen, machen wir KEIN Avoiding (weil wir keine Hindernisse haben).
-    // -> wir liefern die Route (Valhalla) trotzdem und markieren roadworks.status=FAILED.
     for (const bboxKm of BBOX_STEPS_KM) {
       if (timeLeft() < baseValhallaTimeout + 3_500) break;
 
@@ -1088,8 +1120,7 @@ export async function POST(req: NextRequest) {
         rwTelemetry.boxes_ok = 0;
         rwTelemetry.boxes_failed = 1;
         rwTelemetry.status = "FAILED";
-        rwTelemetry.notes =
-          "Baustellendaten konnten nicht geladen werden. Route wird trotzdem geliefert (fail-open).";
+        rwTelemetry.notes = "Baustellendaten konnten nicht geladen werden. Route wird trotzdem geliefert (fail-open).";
         rwTelemetry.errors?.push(rwRes.error ?? `roadworks_failed_status_${rwRes.status}`);
         phases.push({
           phase: "ROADWORKS_STRICT",
@@ -1113,7 +1144,6 @@ export async function POST(req: NextRequest) {
       let iterations = 0;
       let stuckReason: string | null = null;
 
-      // Wenn Roadworks FAILED: wir machen genau 1 Valhalla-Call und sind fertig (stabil, kein Raten).
       if (rwTelemetry.status === "FAILED") {
         const res = await callValhalla(origin, plannerReqBase, [], baseValhallaTimeout, false);
         const route: FeatureCollection = res?.geojson ?? { type: "FeatureCollection", features: [] };
@@ -1139,11 +1169,9 @@ export async function POST(req: NextRequest) {
             roadworks_status: rwTelemetry.status,
           });
 
-          // Stabilität: wir brechen hier ab – Route ist da. (Sonst riskieren wir Vercel Timeout)
           break;
         }
 
-        // Keine Route: nächster bbox step
         phases.push({
           phase: "STRICT",
           bbox_km: bboxKm,
@@ -1156,7 +1184,6 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
-      // Roadworks OK/PARTIAL -> Iterationen erlaubt (timeboxed)
       while (iterations < MAX_ITERATIONS_PER_STEP) {
         const localTimeout = Math.min(maxValhallaTimeout, baseValhallaTimeout + Math.min(2_500, iterations * 600));
         if (timeLeft() < localTimeout + 3_500) {
@@ -1176,7 +1203,6 @@ export async function POST(req: NextRequest) {
           stuckReason = res?.error ?? "Keine Route gefunden (Valhalla).";
           if (avoids.length === 0) break;
 
-          // Stabilitäts-Backoff: Avoids reduzieren (um wieder Route zu bekommen)
           avoids = avoids.slice(0, Math.max(0, avoids.length - (IS_WIDE ? 6 : 10)));
           continue;
         }
@@ -1203,7 +1229,6 @@ export async function POST(req: NextRequest) {
           break;
         }
 
-        // Blocking obs aus aktueller Route ableiten und Avoids erweitern
         const line = route.features[0];
         let routeBufferPoly: any = null;
         try {
@@ -1276,7 +1301,6 @@ export async function POST(req: NextRequest) {
       if (best?.blockingWarnings?.length === 0 && best?.route?.features?.length) break;
     }
 
-    // Fallback ohne Roadworks/Avoids, wenn bisher keine Route existiert (stabil)
     if (!best?.route?.features?.length && timeLeft() >= baseValhallaTimeout + 2_500) {
       const fallbackRes = await callValhalla(origin, plannerReqBase, [], baseValhallaTimeout, false);
       const fallbackRoute: FeatureCollection = fallbackRes?.geojson ?? { type: "FeatureCollection", features: [] };
@@ -1351,7 +1375,6 @@ export async function POST(req: NextRequest) {
       geojson_alts,
     });
   } catch (err: any) {
-    // WICHTIG: Immer JSON zurückgeben (sonst UI: "Unexpected token ... not valid JSON")
     return NextResponse.json(
       {
         meta: {
