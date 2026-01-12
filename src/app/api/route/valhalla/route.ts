@@ -179,6 +179,7 @@ function buildValhallaRequest(
   // Nur avoid_polygons – exclude_polygons weglassen, um doppelte/unklare Interpretation zu vermeiden
   if (hasAvoids) {
     json.avoid_polygons = options.avoid_polygons;
+    json.exclude_polygons = options.avoid_polygons;
   }
 
   return json;
