@@ -82,19 +82,50 @@ function getLimits(p: any) {
  * - NULL/0/NaN => keine Aussage => blockt NICHT
  * - ansonsten: wenn Limit < Fahrzeugwert => blockt
  */
-function blocksVehicle(limits: { width: number | null; weight: number | null }, vWidth: number, vWeight: number) {
-  const w = limits.width;
-  const wt = limits.weight;
+function isClosedObstacle(p: any): boolean {
+  if (!p) return false;
 
-  const blocksWidth = typeof w === "number" && Number.isFinite(w) && w > 0 && w < vWidth;
-  const blocksWeight = typeof wt === "number" && Number.isFinite(wt) && wt > 0 && wt < vWeight;
+  if (p.closed === true || p.road_closed === true || p.blocked === true) {
+    return true;
+  }
+
+  const txt = `${p.title ?? ""} ${p.description ?? ""} ${p.status ?? ""}`.toLowerCase();
+
+  return (
+    txt.includes("gesperrt") ||
+    txt.includes("vollsperr") ||
+    txt.includes("sperrung") ||
+    txt.includes("closed") ||
+    txt.includes("blocked")
+  );
+}
+
+function blocksVehicle(
+  limits: { width: number | null; weight: number | null },
+  vWidth: number,
+  vWeight: number,
+  props?: any
+) {
+  if (isClosedObstacle(props)) {
+    return {
+      blocksWidth: false,
+      blocksWeight: false,
+      blocksAny: true,
+      reason: "CLOSED",
+    };
+  }
+
+  const blocksWidth = limits.width != null && limits.width < vWidth;
+  const blocksWeight = limits.weight != null && limits.weight < vWeight;
 
   return {
     blocksWidth,
     blocksWeight,
     blocksAny: blocksWidth || blocksWeight,
+    reason: blocksWidth ? "WIDTH" : blocksWeight ? "WEIGHT" : null,
   };
 }
+
 
 function stableObsId(obs: Feature<any>): string {
   const p: any = obs.properties || {};
