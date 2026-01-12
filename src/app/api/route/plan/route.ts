@@ -1168,7 +1168,7 @@ export async function POST(req: NextRequest) {
     // ------------- STRICT (kürzere Strecken) -------------
     const BBOX_STEPS_KM = IS_WIDE ? [200, 600, 1400, 2200] : [200, 400, 800, 1400, 2200, 3200];
 
-    const MAX_ITERATIONS_PER_STEP = IS_WIDE ? 10 : 15;
+    const MAX_ITERATIONS_PER_STEP = IS_WIDE ? 25 : 40;
     const MAX_AVOIDS_TOTAL = Math.min(MAX_AVOIDS_GLOBAL, IS_WIDE ? 110 : 140);
     const MAX_NEW_AVOIDS_PER_ITER = IS_WIDE ? 12 : 16;
 
