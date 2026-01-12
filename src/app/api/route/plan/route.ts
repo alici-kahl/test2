@@ -993,7 +993,7 @@ export async function POST(req: NextRequest) {
 
       // Avoid-Iterationen mit Eskalation
       if (best.blockingWarnings.length > 0 && timeLeft() > baseValhallaTimeout + 3_500) {
-        const MAX_ITER_FAST = IS_WIDE ? 10 : 15;
+        const MAX_ITER_FAST = IS_WIDE ? 20 : 30;
         const MAX_AVOIDS_FAST = Math.min(MAX_AVOIDS_GLOBAL, IS_WIDE ? 90 : 120);
         const MAX_NEW_AVOIDS_PER_ITER = IS_WIDE ? 12 : 16;
 
