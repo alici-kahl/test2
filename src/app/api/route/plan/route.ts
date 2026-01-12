@@ -718,7 +718,7 @@ export async function POST(req: NextRequest) {
      * - Gesamtbudget konservativ unter 60s
      * - Roadworks sind "best effort" und dürfen NICHT den Erfolg verhindern
      */
-    const TIME_BUDGET_MS = 45_000;
+    const TIME_BUDGET_MS = 55_000;
     const t0 = Date.now();
     const timeLeft = () => TIME_BUDGET_MS - (Date.now() - t0);
 
