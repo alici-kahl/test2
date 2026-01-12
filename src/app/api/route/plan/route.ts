@@ -1171,7 +1171,7 @@ export async function POST(req: NextRequest) {
       : [200, 400, 800, 1400, 2200, 3500, 5000, 7000, 10000];  // ✅ Normale Fahrzeuge: gleich
 
     const MAX_ITERATIONS_PER_STEP = IS_WIDE ? 25 : 40;
-    const MAX_AVOIDS_TOTAL = Math.min(MAX_AVOIDS_GLOBAL, IS_WIDE ? 110 : 140);
+    const MAX_AVOIDS_TOTAL = Math.min(MAX_AVOIDS_GLOBAL, IS_WIDE ? 200 : 250);
     const MAX_NEW_AVOIDS_PER_ITER = IS_WIDE ? 12 : 16;
 
     let best: Candidate | null = null;
