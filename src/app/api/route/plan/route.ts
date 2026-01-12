@@ -732,7 +732,11 @@ export async function POST(req: NextRequest) {
       Math.max(5_500, Number(body?.roadworks?.buffer_m ?? 60) >= 60 ? 6_500 : 6_000)
     );
 
-    const ROUTE_BUFFER_KM = 0.02;
+    const ROUTE_BUFFER_KM = Math.max(
+      0.06,                       // MIN 60 m
+      0.04 + Math.max(0, vWidth - 2.55) * 0.03
+    );
+
     const origin = req.nextUrl.origin;
 
     const approxKm = haversineKm(start, end);
