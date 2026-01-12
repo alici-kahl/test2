@@ -88,10 +88,10 @@ export async function POST(req: Request) {
     const bbox: BBox | null = isBBox(body?.bbox) ? body.bbox : null;
     const only_motorways: boolean = !!body?.only_motorways;
 
-    // ✅ KRITISCHER FIX: Supabase RPC darf nicht “unendlich” hängen.
+    // ✅ FIX: Timeout erhöht von 4.5s auf 12s (Supabase RPC ist langsam)
     const requested =
-      typeof body?.timeout_ms === "number" && body.timeout_ms > 0 ? body.timeout_ms : 4_500;
-    const timeoutMs = Math.min(requested, 8_000);
+      typeof body?.timeout_ms === "number" && body.timeout_ms > 0 ? body.timeout_ms : 12_000;
+    const timeoutMs = Math.min(requested, 15_000);
 
     if (!ts) {
       return NextResponse.json(
