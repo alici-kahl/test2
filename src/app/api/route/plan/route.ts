@@ -1,7 +1,3 @@
-NEUE
-
-
-
 // src/app/api/route/plan/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import bboxFn from "@turf/bbox";
