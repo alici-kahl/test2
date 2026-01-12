@@ -1166,7 +1166,9 @@ export async function POST(req: NextRequest) {
     }
 
     // ------------- STRICT (kürzere Strecken) -------------
-    const BBOX_STEPS_KM = IS_WIDE ? [200, 600, 1400, 2200] : [200, 400, 800, 1400, 2200, 3200];
+    const BBOX_STEPS_KM = IS_WIDE 
+      ? [200, 600, 1400, 2200, 3500, 5000, 7000, 10000]  // ✅ Breite Fahrzeuge: bis 10.000 km suchen!
+      : [200, 400, 800, 1400, 2200, 3500, 5000, 7000, 10000];  // ✅ Normale Fahrzeuge: gleich
 
     const MAX_ITERATIONS_PER_STEP = IS_WIDE ? 25 : 40;
     const MAX_AVOIDS_TOTAL = Math.min(MAX_AVOIDS_GLOBAL, IS_WIDE ? 110 : 140);
