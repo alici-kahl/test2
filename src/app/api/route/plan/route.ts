@@ -321,8 +321,8 @@ function computeRouteStats(
     roadworksHits++;
 
     const limits = getLimits(obs.properties);
-    const { blocksAny } = blocksVehicle(limits, vWidth, vWeight);
-    if (!blocksAny) continue;
+    const blockInfo = blocksVehicle(limits, vWidth, vWeight, obs.properties);
+    if (!blockInfo.blocksAny) continue;
 
     let cc: any = null;
     try {
@@ -335,6 +335,7 @@ function computeRouteStats(
       title: obs.properties?.title,
       description: obs.properties?.description,
       limits,
+      block_reason: blockInfo.reason,
       coords: cc,
       already_avoided: avoidIds ? avoidIds.has(stableObsId(obs)) : false,
     });
