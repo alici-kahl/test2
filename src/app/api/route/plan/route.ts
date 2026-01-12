@@ -1073,7 +1073,7 @@ export async function POST(req: NextRequest) {
             let escalated = 0;
             for (const obs of stillBlockingAvoided.slice(0, IS_WIDE ? 6 : 8)) {
               const id = stableObsId(obs);
-              const r = upsertAvoid(avoidMap, avoidAttempts, obs, avoidBufferKmBase, 3.2);
+              const r = upsertAvoid(avoidMap, avoidAttempts, obs, avoidBufferKmBase, 4.0);
               if (!r.ok) continue;
 
               avoidIds.add(id);
