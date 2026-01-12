@@ -1454,10 +1454,10 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const status: "CLEAN" | "WARN" = best.blockingWarnings.length > 0 ? "WARN" : "CLEAN";
+    const status: "CLEAN" | "BLOCKED" = best.blockingWarnings.length > 0 ? "BLOCKED" : "CLEAN";
     const errorMsg =
-      status === "WARN"
-        ? "Route gefunden, aber es gibt blockierende Baustellen. Es wurden Umfahrungen versucht; bitte Warnungen prüfen."
+      status === "BLOCKED"
+        ? "❌ KEINE DURCHFAHRBARE ROUTE GEFUNDEN. Alle Alternativen führen durch Baustellen, die für Ihr Fahrzeug zu eng/schwer sind. Bitte ändern Sie Start/Ziel oder Fahrzeugparameter."
         : null;
 
     const geojson_alts = altCandidates.filter((c) => c.route?.features?.length).map((c) => c.route);
