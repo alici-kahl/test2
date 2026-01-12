@@ -1139,9 +1139,9 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      const status: "CLEAN" | "WARN" = best.blockingWarnings.length ? "WARN" : "CLEAN";
+      const status: "CLEAN" | "BLOCKED" = best.blockingWarnings.length ? "BLOCKED" : "CLEAN";
       const errorMsg =
-        status === "WARN"
+        status === "BLOCKED"
           ? "Route gefunden, aber es gibt blockierende Baustellen. Es wurden Umfahrungen versucht; bitte Warnungen prüfen."
           : null;
 
