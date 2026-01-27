@@ -477,13 +477,15 @@ async function callValhalla(
   alternates_override?: number
 ) {
   const polys = avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined;
+
+  // WICHTIG: Payload klein halten -> NUR exclude_polygons, nicht doppelt.
   const payload = {
     ...reqBody,
     escape_mode: escape_mode ? true : undefined,
     alternates: typeof alternates_override === "number" ? alternates_override : reqBody?.alternates,
-    avoid_polygons: polys,
     exclude_polygons: polys,
   };
+
   const out = await fetchJSONSafe(`${origin}/api/route/valhalla`, payload, timeoutMs);
   if (out.ok && out.data) return out.data;
   return {
@@ -569,13 +571,16 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const requireClean = Boolean(body.require_clean);
+    // CHANGED: Default = true (Projektziel: immer durchpassbar routen).
+    const requireClean = body.require_clean === undefined ? true : Boolean(body.require_clean);
+
     const ts = body.ts ?? new Date().toISOString();
     const tz = body.tz ?? "Europe/Berlin";
     const vWidth = body.vehicle?.width_m ?? 2.55;
     const vWeight = body.vehicle?.weight_t ?? 40;
 
-    const TIME_BUDGET_MS = 57_000;
+    // CHANGED: internes Budget kleiner als Vercel maxDuration -> kontrolliertes Ende, weniger 504.
+    const TIME_BUDGET_MS = 52_000;
     const t0 = Date.now();
     const timeLeft = () => TIME_BUDGET_MS - (Date.now() - t0);
 
@@ -689,6 +694,7 @@ export async function POST(req: NextRequest) {
       });
     };
 
+    // LONG ROUTE FAST PATH
     if (approxKm >= LONG_ROUTE_KM) {
       if (timeLeft() < baseValhallaTimeout + 2_500) {
         return NextResponse.json({
@@ -759,7 +765,11 @@ export async function POST(req: NextRequest) {
         rwTelemetry.timeout_ms = perCallTimeout;
         const results = await Promise.all(
           boxes.map((bb) =>
-            callRoadworks(origin, { ts, tz, bbox: bb, buffer_m: roadworksBufferM, only_motorways: onlyMotorways }, perCallTimeout)
+            callRoadworks(
+              origin,
+              { ts, tz, bbox: bb, buffer_m: roadworksBufferM, only_motorways: onlyMotorways },
+              perCallTimeout
+            )
           )
         );
         for (const r of results) {
@@ -779,7 +789,8 @@ export async function POST(req: NextRequest) {
         else if (rwTelemetry.boxes_ok > 0) rwTelemetry.status = "PARTIAL";
         else rwTelemetry.status = "FAILED";
         if (rwTelemetry.status !== "OK") {
-          rwTelemetry.notes = "Baustellendaten konnten nicht vollständig geladen werden. Route wird trotzdem geliefert (fail-open).";
+          rwTelemetry.notes =
+            "Baustellendaten konnten nicht vollständig geladen werden. Ergebnis kann nicht garantiert baustellenfrei sein.";
         }
       } else {
         rwTelemetry.status = "FAILED";
@@ -798,14 +809,20 @@ export async function POST(req: NextRequest) {
         meta: { bbox_km: null, avoids_applied: 0, fallback_used: true },
       };
 
+      // CHANGED: Wenn Roadworks FAILED -> nicht CLEAN behaupten.
       if (rwTelemetry.status === "FAILED") {
         phases.push({ phase: "FAST_PATH", approx_km: approxKm, result: "OK_ROUTE_NO_ROADWORKS", boxes: boxes.length });
+
+        const status = requireClean ? "ERROR" : "WARN";
+        const error =
+          "Baustellendaten konnten nicht geladen werden. Route wird geliefert, kann aber nicht als baustellenfrei garantiert werden.";
+
         return NextResponse.json({
           meta: {
             source: "route/plan-stable-v1",
-            status: "CLEAN",
-            clean: true,
-            error: null,
+            status,
+            clean: false,
+            error,
             iterations: totalIterations,
             avoids_applied: 0,
             bbox_km_used: null,
@@ -938,8 +955,10 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      const status: "CLEAN" | "BLOCKED" = "CLEAN";
-      const errorMsg = best.blockingWarnings.length > 0 
+      // CHANGED: status darf nicht CLEAN sein, wenn clean=false
+      const clean = best.blockingWarnings.length === 0;
+      const status = clean ? "CLEAN" : "WARN";
+      const errorMsg = !clean
         ? "⚠️ WARNUNG: Route gefunden, aber folgende Baustellen könnten zu eng/schwer sein. Bitte prüfen Sie die Details."
         : null;
 
@@ -947,7 +966,7 @@ export async function POST(req: NextRequest) {
         meta: {
           source: "route/plan-stable-v1",
           status,
-          clean: best.blockingWarnings.length === 0,
+          clean,
           error: errorMsg,
           iterations: totalIterations,
           avoids_applied: best.meta.avoids_applied,
@@ -963,7 +982,8 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const BBOX_STEPS_KM = [200, 400, 800, 1400, 2200, 3500, 5000, 7000, 10000, 15000];
+    // CHANGED: BBox Eskalation muss bei kleinen Steps starten, sonst ziehst du für Kurzstrecken viel zu viele Roadworks.
+    const BBOX_STEPS_KM = [20, 40, 80, 150, 250, 400, 800, 1400, 2200, 3500, 5000, 7000, 10000, 15000];
     const MAX_ITERATIONS_PER_STEP = 50;
     const MAX_AVOIDS_TOTAL = 300;
     const MAX_NEW_AVOIDS_PER_ITER = IS_WIDE ? 12 : 16;
@@ -973,6 +993,7 @@ export async function POST(req: NextRequest) {
 
     for (const bboxKm of BBOX_STEPS_KM) {
       if (timeLeft() < baseValhallaTimeout + 3_500) break;
+
       const bbox = makeSafeBBox(start, end, bboxKm);
       rwTelemetry.status = "PARTIAL";
       rwTelemetry.boxes_total = 1;
@@ -982,9 +1003,15 @@ export async function POST(req: NextRequest) {
       rwTelemetry.used = 0;
       rwTelemetry.notes = null;
       rwTelemetry.errors = [];
+
       const rwCallTimeout = Math.min(ROADWORKS_TIMEOUT_MS, Math.max(5_000, Math.floor(timeLeft() / 3)));
       rwTelemetry.timeout_ms = rwCallTimeout;
-      const rwRes = await callRoadworks(origin, { ts, tz, bbox, buffer_m: roadworksBufferM, only_motorways: onlyMotorways }, rwCallTimeout);
+
+      const rwRes = await callRoadworks(
+        origin,
+        { ts, tz, bbox, buffer_m: roadworksBufferM, only_motorways: onlyMotorways },
+        rwCallTimeout
+      );
 
       let rawObstacles: Feature<any>[] = [];
       if (rwRes.ok) {
@@ -997,7 +1024,8 @@ export async function POST(req: NextRequest) {
         rwTelemetry.boxes_ok = 0;
         rwTelemetry.boxes_failed = 1;
         rwTelemetry.status = "FAILED";
-        rwTelemetry.notes = "Baustellendaten konnten nicht geladen werden. Route wird trotzdem geliefert (fail-open).";
+        rwTelemetry.notes =
+          "Baustellendaten konnten nicht geladen werden. Ergebnis kann nicht garantiert baustellenfrei sein.";
         rwTelemetry.errors?.push(rwRes.error ?? `roadworks_failed_status_${rwRes.status}`);
         phases.push({
           phase: "ROADWORKS_STRICT",
@@ -1010,8 +1038,10 @@ export async function POST(req: NextRequest) {
       }
 
       const corridorKmStep = Math.min(120, Math.max(corridorKm, bboxKm * 0.045));
-      const obstacles: Feature<any>[] = rawObstacles.length > 0 ? prioritizeObstacles(rawObstacles, start, end, corridorKmStep, 1900) : [];
+      const obstacles: Feature<any>[] =
+        rawObstacles.length > 0 ? prioritizeObstacles(rawObstacles, start, end, corridorKmStep, 1900) : [];
       rwTelemetry.used = obstacles.length;
+
       const avoidMap = new Map<string, Feature<Polygon>>();
       const avoidAttempts = new Map<string, number>();
       const avoidIds = new Set<string>();
@@ -1039,6 +1069,12 @@ export async function POST(req: NextRequest) {
             reason: rwTelemetry.notes,
             roadworks_status: rwTelemetry.status,
           });
+
+          // Wenn require_clean=true und Roadworks fehlen, darf das NICHT als clean gelten.
+          if (requireClean) {
+            break;
+          }
+
           break;
         }
         phases.push({
@@ -1061,9 +1097,11 @@ export async function POST(req: NextRequest) {
         }
         iterations++;
         totalIterations++;
+
         const escapeNow = avoidMap.size > 0;
         const avoidsArr = Array.from(avoidMap.values());
         const res = await callValhalla(origin, plannerReqBase, avoidsArr, localTimeout, escapeNow, escapeNow ? 5 : undefined);
+
         const route: FeatureCollection = res?.geojson ?? { type: "FeatureCollection", features: [] };
         if (!route?.features?.length) {
           stuckReason = res?.error ?? "Keine Route gefunden (Valhalla).";
@@ -1072,6 +1110,7 @@ export async function POST(req: NextRequest) {
           for (const k of keys.slice(-Math.min(IS_WIDE ? 6 : 10, keys.length))) avoidMap.delete(k);
           continue;
         }
+
         const { blockingWarnings, roadworksHits } = computeRouteStats(route, obstacles, ROUTE_BUFFER_KM, vWidth, vWeight, avoidIds);
         const cand: Candidate = {
           route,
@@ -1081,14 +1120,17 @@ export async function POST(req: NextRequest) {
           meta: { bbox_km: bboxKm, avoids_applied: avoidMap.size, fallback_used: false },
         };
         best = pickBetterCandidate(best, cand);
+
         if (altCandidates.length < 3) {
           const alreadySimilar = altCandidates.some((c) => Math.abs((c.distance_km || 0) - (cand.distance_km || 0)) < 0.1);
           if (!alreadySimilar) altCandidates.push(cand);
         }
+
         if (blockingWarnings.length === 0) {
           stuckReason = null;
           break;
         }
+
         const line = route.features[0];
         let routeBufferPoly: any = null;
         try {
@@ -1096,6 +1138,7 @@ export async function POST(req: NextRequest) {
         } catch {
           routeBufferPoly = null;
         }
+
         const newBlocking: Feature<any>[] = [];
         const stillBlockingAvoided: Feature<any>[] = [];
         for (const obs of obstacles) {
@@ -1114,6 +1157,7 @@ export async function POST(req: NextRequest) {
           else stillBlockingAvoided.push(obs);
           if (newBlocking.length + stillBlockingAvoided.length >= MAX_BLOCKING_SCAN) break;
         }
+
         newBlocking.sort((a, b) => {
           const la = getLimits(a.properties);
           const lb = getLimits(b.properties);
@@ -1126,6 +1170,7 @@ export async function POST(req: NextRequest) {
           if (la.width !== lb.width) return (la.width ?? 0) - (lb.width ?? 0);
           return (la.weight ?? 0) - (lb.weight ?? 0);
         });
+
         let added = 0;
         for (const obs of newBlocking) {
           if (avoidMap.size >= MAX_AVOIDS_TOTAL) break;
@@ -1135,6 +1180,7 @@ export async function POST(req: NextRequest) {
           added++;
           if (added >= MAX_NEW_AVOIDS_PER_ITER) break;
         }
+
         if (added === 0 && stillBlockingAvoided.length > 0) {
           let escalated = 0;
           for (const obs of stillBlockingAvoided.slice(0, IS_WIDE ? 6 : 8)) {
@@ -1146,6 +1192,7 @@ export async function POST(req: NextRequest) {
           }
           if (escalated > 0) added = escalated;
         }
+
         if (added === 0) {
           stuckReason = "Konnte keine neuen oder eskalierbaren Avoid-Polygone hinzufügen.";
           break;
@@ -1157,7 +1204,7 @@ export async function POST(req: NextRequest) {
         bbox_km: bboxKm,
         iterations,
         avoids_applied: best?.meta?.avoids_applied ?? 0,
-        result: best?.route?.features?.length ? "CANDIDATE" : "NO_ROUTE",
+        result: best?.route?.features?.length ? (best?.blockingWarnings?.length === 0 ? "CLEAN" : "CANDIDATE") : "NO_ROUTE",
         reason: stuckReason,
         roadworks_status: rwTelemetry.status,
       });
@@ -1211,8 +1258,11 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const status: "CLEAN" | "BLOCKED" = "CLEAN";
-    const errorMsg = best.blockingWarnings.length > 0 
+    const clean = best.blockingWarnings.length === 0;
+
+    // CHANGED: status korrekt zur clean-Flag setzen
+    const status = clean ? "CLEAN" : "WARN";
+    const errorMsg = !clean
       ? "⚠️ WARNUNG: Route gefunden, aber folgende Baustellen könnten zu eng/schwer sein. Bitte prüfen Sie die Details."
       : null;
 
@@ -1222,7 +1272,7 @@ export async function POST(req: NextRequest) {
       meta: {
         source: "route/plan-stable-v1",
         status,
-        clean: best.blockingWarnings.length === 0,
+        clean,
         error: errorMsg,
         iterations: totalIterations,
         avoids_applied: best.meta.avoids_applied,
