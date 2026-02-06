@@ -568,6 +568,7 @@ async function callValhalla(
   escape_mode: payload.escape_mode ?? false,
   alternates: payload.alternates,
   avoid_polygons_count: Array.isArray(payload.avoid_polygons) ? payload.avoid_polygons.length : 0,
+  avoid_sample_bboxes: avoidDebug,
   timeoutMs,
 });
   
