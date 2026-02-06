@@ -241,6 +241,14 @@ async function fetchValhalla(
 
 export async function POST(req: NextRequest) {
   const body = (await req.json().catch(() => ({}))) as any;
+  
+  console.log("[VALHALLA IN]", {
+  alternates: body?.alternates,
+  escape_mode: body?.escape_mode,
+  avoid_polygons_count: Array.isArray(body?.avoid_polygons) ? body.avoid_polygons.length : 0,
+  exclude_polygons_count: Array.isArray(body?.exclude_polygons) ? body.exclude_polygons.length : 0,
+});
+
 
   // Robust: start/end aus body.start/body.end ODER fallback auf body.locations
   let start: Coords | null = normalizeCoords(body.start);
