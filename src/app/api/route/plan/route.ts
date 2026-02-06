@@ -551,6 +551,13 @@ async function callValhalla(
     exclude_polygons: polys,
   };
 
+  console.log("[PLAN->VALHALLA]", {
+  escape_mode: payload.escape_mode ?? false,
+  alternates: payload.alternates,
+  avoid_polygons_count: Array.isArray(payload.avoid_polygons) ? payload.avoid_polygons.length : 0,
+  timeoutMs,
+});
+  
   const out = await fetchJSONSafe(`${origin}/api/route/valhalla`, payload, timeoutMs);
   if (out.ok && out.data) return out.data;
   return {
