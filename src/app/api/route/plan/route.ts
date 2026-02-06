@@ -32,6 +32,9 @@ type PlanReq = {
   valhalla_soft_max?: number;
   respect_direction?: boolean;
   require_clean?: boolean;
+
+  /** Optional: enables debug block in response (no behavior change, only telemetry) */
+  debug?: boolean;
 };
 
 type RoadworksTelemetry = {
@@ -116,6 +119,37 @@ function blocksVehicle(
 function stableObsId(obs: Feature<any>): string {
   const p: any = obs.properties || {};
   return String(p.roadwork_id ?? p.external_id ?? p.restriction_id ?? p.id ?? JSON.stringify(bboxFn(obs)));
+}
+
+function safeSlice<T>(arr: T[], n: number) {
+  return Array.isArray(arr) ? arr.slice(0, Math.max(0, n)) : [];
+}
+
+function summarizeAvoids(polys: Feature<Polygon>[], max = 5) {
+  return safeSlice(polys, max).map((p) => {
+    const pr: any = p.properties || {};
+    return {
+      id: pr.roadwork_id ?? null,
+      title: pr.title ?? null,
+      bbox: (() => {
+        try {
+          return bboxFn(p as any);
+        } catch {
+          return null;
+        }
+      })(),
+    };
+  });
+}
+
+function summarizeBlockingWarnings(warns: any[], max = 8) {
+  return safeSlice(warns, max).map((w) => ({
+    title: w?.title ?? null,
+    block_reason: w?.block_reason ?? null,
+    limits: w?.limits ?? null,
+    already_avoided: Boolean(w?.already_avoided),
+    coords: w?.coords ?? null,
+  }));
 }
 
 function getRouteCoords(route: FeatureCollection): Coords[] {
@@ -577,6 +611,8 @@ export async function POST(req: NextRequest) {
     const start = body.start;
     const end = body.end;
 
+    const DEBUG = Boolean((body as any)?.debug);
+
     if (!Array.isArray(start) || start.length !== 2 || !Array.isArray(end) || end.length !== 2) {
       return NextResponse.json(
         {
@@ -601,6 +637,15 @@ export async function POST(req: NextRequest) {
           geojson: { type: "FeatureCollection", features: [] },
           blocking_warnings: [],
           geojson_alts: [],
+          ...(DEBUG
+            ? {
+                debug: {
+                  invalid_input: true,
+                  received_start: start ?? null,
+                  received_end: end ?? null,
+                },
+              }
+            : {}),
         },
         { status: 400 }
       );
@@ -658,6 +703,33 @@ export async function POST(req: NextRequest) {
       errors: [],
     };
 
+    // Debug telemetry (response-only)
+    const dbg: any = DEBUG
+      ? {
+          valhalla_calls: 0,
+          last_valhalla: null as any,
+          notes: [] as any[],
+        }
+      : null;
+
+    const callValhallaDbg = async (
+      avoidPolys: Feature<Polygon>[],
+      timeoutMs: number,
+      escapeMode: boolean,
+      alternatesOverride: number
+    ) => {
+      if (dbg) {
+        dbg.valhalla_calls++;
+        dbg.last_valhalla = {
+          timeout_ms: timeoutMs,
+          escape_mode: Boolean(escapeMode),
+          avoid_count: avoidPolys.length,
+          avoid_sample: summarizeAvoids(avoidPolys, 5),
+        };
+      }
+      return callValhalla(origin, plannerReqBase, avoidPolys, timeoutMs, escapeMode, alternatesOverride);
+    };
+
     const finalizeResponse = (
       best: Candidate | null,
       extra: { bbox_km_used?: number | null; fallback_used?: boolean }
@@ -671,6 +743,30 @@ export async function POST(req: NextRequest) {
         hasRoute && !clean
           ? "⚠️ WARNUNG: Keine vollständig baustellenfreie Route gefunden. Es wird die beste verfügbare Route geliefert – bitte prüfen Sie die markierten Problemstellen."
           : null;
+
+      const debug =
+        DEBUG
+          ? {
+              time_left_ms: timeLeft(),
+              approx_km: approxKm,
+              route_has_features: hasRoute,
+              route_distance_km: best?.distance_km ?? null,
+              blocking_warnings_count: best?.blockingWarnings?.length ?? 0,
+              blocking_warnings_sample: summarizeBlockingWarnings(best?.blockingWarnings ?? [], 8),
+              avoids_applied: best?.meta?.avoids_applied ?? 0,
+              bbox_km_used: extra.bbox_km_used ?? best?.meta?.bbox_km ?? null,
+              fallback_used: Boolean(extra.fallback_used ?? best?.meta?.fallback_used ?? false),
+              valhalla_calls: dbg?.valhalla_calls ?? 0,
+              last_valhalla: dbg?.last_valhalla ?? null,
+              roadworks_status: rwTelemetry.status,
+              roadworks_boxes: {
+                total: rwTelemetry.boxes_total,
+                ok: rwTelemetry.boxes_ok,
+                failed: rwTelemetry.boxes_failed,
+              },
+              notes: dbg?.notes ?? [],
+            }
+          : undefined;
 
       return NextResponse.json({
         meta: {
@@ -691,6 +787,7 @@ export async function POST(req: NextRequest) {
         geojson: best?.route ?? { type: "FeatureCollection", features: [] },
         blocking_warnings: best?.blockingWarnings ?? [],
         geojson_alts: [],
+        ...(debug ? { debug } : {}),
       });
     };
 
@@ -730,7 +827,7 @@ export async function POST(req: NextRequest) {
       if (timeLeft() < 4_500) {
         const quickTimeout = Math.max(2_500, Math.min(6_000, timeLeft() - 1_000));
         if (quickTimeout > 2_500) {
-          const resQ = await callValhalla(origin, plannerReqBase, [], quickTimeout, false, 0);
+          const resQ = await callValhallaDbg([], quickTimeout, false, 0);
           const routeQ: FeatureCollection = resQ?.geojson ?? { type: "FeatureCollection", features: [] };
           const candQ: Candidate = {
             route: routeQ,
@@ -746,7 +843,7 @@ export async function POST(req: NextRequest) {
         return finalizeResponse(null, { bbox_km_used: null, fallback_used: true });
       }
 
-      const res0 = await callValhalla(origin, plannerReqBase, [], baseValhallaTimeout, false, 0);
+      const res0 = await callValhallaDbg([], baseValhallaTimeout, false, 0);
       const route0: FeatureCollection = res0?.geojson ?? { type: "FeatureCollection", features: [] };
 
       if (!route0?.features?.length) {
@@ -778,7 +875,11 @@ export async function POST(req: NextRequest) {
 
         const results = await Promise.all(
           boxes.map((bb) =>
-            callRoadworks(origin, { ts, tz, bbox: bb, buffer_m: roadworksBufferM, only_motorways: onlyMotorways }, perCallTimeout)
+            callRoadworks(
+              origin,
+              { ts, tz, bbox: bb, buffer_m: roadworksBufferM, only_motorways: onlyMotorways },
+              perCallTimeout
+            )
           )
         );
 
@@ -910,7 +1011,7 @@ export async function POST(req: NextRequest) {
 
           const avoidsArr = Array.from(avoidMap.values());
 
-          const res = await callValhalla(origin, plannerReqBase, avoidsArr, baseValhallaTimeout, true, 0);
+          const res = await callValhallaDbg(avoidsArr, baseValhallaTimeout, true, 0);
           const route: FeatureCollection = res?.geojson ?? { type: "FeatureCollection", features: [] };
 
           if (!route?.features?.length) {
@@ -978,7 +1079,11 @@ export async function POST(req: NextRequest) {
       const rwCallTimeout = Math.min(ROADWORKS_TIMEOUT_MS, Math.max(5_000, Math.floor(timeLeft() / 3)));
       rwTelemetry.timeout_ms = rwCallTimeout;
 
-      const rwRes = await callRoadworks(origin, { ts, tz, bbox, buffer_m: roadworksBufferM, only_motorways: onlyMotorways }, rwCallTimeout);
+      const rwRes = await callRoadworks(
+        origin,
+        { ts, tz, bbox, buffer_m: roadworksBufferM, only_motorways: onlyMotorways },
+        rwCallTimeout
+      );
 
       let rawObstacles: Feature<any>[] = [];
       if (rwRes.ok) {
@@ -1016,7 +1121,7 @@ export async function POST(req: NextRequest) {
       let stuckReason: string | null = null;
 
       if (rwTelemetry.status === "FAILED") {
-        const res = await callValhalla(origin, plannerReqBase, [], baseValhallaTimeout, false, 0);
+        const res = await callValhallaDbg([], baseValhallaTimeout, false, 0);
         const route: FeatureCollection = res?.geojson ?? { type: "FeatureCollection", features: [] };
         totalIterations++;
 
@@ -1066,7 +1171,7 @@ export async function POST(req: NextRequest) {
         const escapeNow = avoidMap.size > 0;
         const avoidsArr = Array.from(avoidMap.values());
 
-        const res = await callValhalla(origin, plannerReqBase, avoidsArr, localTimeout, escapeNow, 0);
+        const res = await callValhallaDbg(avoidsArr, localTimeout, escapeNow, 0);
         const route: FeatureCollection = res?.geojson ?? { type: "FeatureCollection", features: [] };
 
         if (!route?.features?.length) {
@@ -1181,7 +1286,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (!best?.route?.features?.length && timeLeft() >= baseValhallaTimeout + 2_500) {
-      const fallbackRes = await callValhalla(origin, plannerReqBase, [], baseValhallaTimeout, false, 0);
+      const fallbackRes = await callValhallaDbg([], baseValhallaTimeout, false, 0);
       const fallbackRoute: FeatureCollection = fallbackRes?.geojson ?? { type: "FeatureCollection", features: [] };
       if (fallbackRoute?.features?.length) {
         best = {
