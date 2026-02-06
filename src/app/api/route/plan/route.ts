@@ -543,6 +543,19 @@ async function callValhalla(
 ) {
   const polys = avoidPolys.length ? avoidPolys.map((p) => p.geometry) : undefined;
 
+  const avoidDebug =
+  avoidPolys && avoidPolys.length
+    ? avoidPolys.slice(0, 5).map((p) => {
+        try {
+          const b = bboxFn(p as any);
+          return { bbox: b.map((x: number) => Number(x.toFixed(4))), title: (p as any)?.properties?.title ?? null };
+        } catch {
+          return { bbox: null, title: (p as any)?.properties?.title ?? null };
+        }
+      })
+    : [];
+
+
   const payload = {
     ...reqBody,
     escape_mode: escape_mode ? true : undefined,
